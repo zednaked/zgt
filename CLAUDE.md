@@ -6,9 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **ZeDs Godot Terminal (ZGT)** — a Godot 4 GDExtension (C++) providing a built-in terminal emulator in the editor's bottom panel. The native `ZGTerminal` Control runs a real shell on a PTY and renders the character grid itself, so it works identically under X11 and Wayland. Linux only.
 
-> History: this started as a Kitty-window-embedding hack (reparenting an X11 `kitty` window into the editor). That is unreliable on Wayland compositors (e.g. Hyprland) because XWayland clients can't position their own windows, so it was replaced by a self-contained PTY terminal. The whole project was then renamed to "ZGT" (display name "ZeDs Godot Terminal"). The `demo/` directory is a ready-to-use test Godot project.
+> History: this started as a Kitty-window-embedding hack (reparenting an X11 `kitty` window into the editor). That is unreliable on Wayland compositors (e.g. Hyprland) because XWayland clients can't position their own windows, so it was replaced by a self-contained PTY terminal. The whole project was then renamed to "ZGT" (display name "ZeDs Godot Terminal").
 
-## Build & Setup
+## Repositories
+
+| Repo | URL | Visibility |
+|---|---|---|
+| **zgt** (source) | `https://github.com/zednaked/zgt` | Private |
+| **zgt-bin** (binaries) | `https://github.com/zednaked/zgt-bin` | Public |
+
+## Local directories
+
+| Path | Role |
+|---|---|
+| `/home/zed/dev/zeds-godot-terminal` | **Source repo root** — C++ source, addon, build system, this doc |
+| `/home/zed/dev/zeds-godot-terminal/demo/` | Godot test project inside the repo |
+| `/home/zed/dev/godotterminal` | Development copy with `godot-cpp/` pre-cloned and built |
+| `/home/zed/dev/kitty_terminal_test` | **Legacy** — old X11 kitty-embedding approach (abandoned) |
+| `/home/zed/kitty-terminal-test` | **Legacy** — old standalone test project (replaced by `demo/`) |
+
+## Build
 
 ```bash
 ./setup.sh                          # Clones godot-cpp and checks out the 4.3 branch (one-time)
@@ -16,7 +33,7 @@ scons platform=linux                # Build -> bin/libzgt.linux.template_debug.x
 scons platform=linux target=template_release   # Release build
 ```
 
-`scons` may not be on PATH here. Manual build (godot-cpp must already be compiled):
+Manual build (godot-cpp must already be compiled):
 
 ```bash
 g++ -std=c++17 -fPIC -shared -O2 -DLINUX_ENABLED \
@@ -25,9 +42,26 @@ g++ -std=c++17 -fPIC -shared -O2 -DLINUX_ENABLED \
   -o bin/libzgt.linux.template_debug.x86_64.so
 ```
 
-No automated tests. To verify: build, then copy `bin/*.so` into `demo/bin/`, open `demo/project.godot` in the editor, enable the **"ZeDs Godot Terminal"** plugin (Project Settings → Plugins), click the **"ZGT"** bottom-panel tab and type into the shell. On Wayland, launch the editor with `--display-driver x11` or native; both work since nothing depends on the windowing system. Test a non-default shell with `SHELL=/usr/bin/fish godot --editor ...`.
+Build output goes to `bin/`. `bin/`, `godot-cpp/`, and `.godot/` are gitignored. `godot-cpp` is pinned to branch `4.3` even though `compatibility_minimum` is `4.2`.
 
-`bin/`, `godot-cpp/`, and `.godot/` are gitignored. `godot-cpp` is pinned to branch `4.3` even though `compatibility_minimum` is `4.2`.
+## Verify
+
+```bash
+cp bin/*.so demo/bin/
+godot --editor demo/project.godot   # or open demo/project.godot in the editor
+```
+
+Enable **"ZeDs Godot Terminal"** plugin (Project Settings → Plugins), click the **"ZGT"** bottom-panel tab and type into the shell. Test a non-default shell with `SHELL=/usr/bin/fish godot --editor ...`.
+
+## Deploy
+
+After building, copy artifacts into the demo and optionally push to the binary repo:
+
+```bash
+cp bin/*.so demo/bin/
+# Commit & push source changes to zgt (private)
+# New release on zgt-bin (public) with the .so files
+```
 
 ## Naming map (everything is "zgt")
 
@@ -65,4 +99,4 @@ Two cooperating layers:
 
 ## Known limitations / next ideas
 
-Truecolor, scrollback+wheel, selection/copy, bracketed paste, and fish-compat queries are done. Not yet: scrollback search, configurable font/size/theme, `sixel`/image protocols, OSC 52 clipboard, reflow of scrollback on resize (only the live grid reflows), and the dir/cosmetic names still saying "kitty".
+Truecolor, scrollback+wheel, selection/copy, bracketed paste, and fish-compat queries are done. Not yet: scrollback search, configurable font/size/theme, `sixel`/image protocols, OSC 52 clipboard, reflow of scrollback on resize (only the live grid reflows).
