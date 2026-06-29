@@ -6,6 +6,7 @@
 #include <godot_cpp/classes/input_event_key.hpp>
 #include <godot_cpp/classes/input_event_mouse_button.hpp>
 #include <godot_cpp/classes/input_event_mouse_motion.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -79,6 +80,8 @@ ZGTerminal::~ZGTerminal() {
 void ZGTerminal::_bind_methods() {
     ClassDB::bind_method(D_METHOD("start_terminal"), &ZGTerminal::start_terminal);
     ClassDB::bind_method(D_METHOD("stop_terminal"), &ZGTerminal::stop_terminal);
+
+    ADD_SIGNAL(MethodInfo("title_changed", PropertyInfo(Variant::STRING, "title")));
 }
 
 // ---------- grid helpers ----------
@@ -188,6 +191,14 @@ void ZGTerminal::_start_shell() {
     ws.ws_xpixel = 0;
     ws.ws_ypixel = 0;
 
+    // Resolve the project root in the parent (calling into the engine from the
+    // forked child would be unsafe) so the shell — and tools like `claude` — start
+    // inside the project.
+    CharString project_root;
+    if (ProjectSettings::get_singleton()) {
+        project_root = ProjectSettings::get_singleton()->globalize_path("res://").utf8();
+    }
+
     int fd = -1;
     int pid = forkpty(&fd, nullptr, nullptr, &ws);
     if (pid < 0) {
@@ -195,6 +206,10 @@ void ZGTerminal::_start_shell() {
         return;
     }
     if (pid == 0) {
+        if (project_root.length() > 0) {
+            (void)chdir(project_root.get_data());
+            setenv("GODOT_PROJECT_PATH", project_root.get_data(), 1);
+        }
         setenv("TERM", "xterm-256color", 1);
         setenv("COLORTERM", "truecolor", 1);
         const char *shell = getenv("SHELL");
@@ -206,7 +221,6 @@ void ZGTerminal::_start_shell() {
     child_pid = pid;
     master_fd = fd;
     fcntl(master_fd, F_SETFL, O_NONBLOCK);
-    signal(SIGCHLD, _sigchld_handler);
 
     set_process(true);
     queue_redraw();
@@ -216,15 +230,28 @@ void ZGTerminal::_start_shell() {
 void ZGTerminal::_stop_shell() {
 #ifdef LINUX_ENABLED
     set_process(false);
-    if (child_pid > 0) {
-        kill(child_pid, SIGTERM);
-        child_pid = 0;
-    }
+    // Close the master first so the shell sees EOF/SIGHUP and starts exiting.
     if (master_fd >= 0) {
         close(master_fd);
         master_fd = -1;
     }
-    signal(SIGCHLD, SIG_DFL);
+    // Reap only our own child. We deliberately do NOT install a process-wide
+    // SIGCHLD handler: this Control runs inside the Godot editor, and a global
+    // waitpid(-1) would steal the exit status of the editor's own subprocesses
+    // (running the game, asset imports, ...).
+    if (child_pid > 0) {
+        kill(child_pid, SIGTERM);
+        bool reaped = false;
+        for (int i = 0; i < 100 && !reaped; i++) { // wait up to ~100ms
+            if (waitpid(child_pid, nullptr, WNOHANG) != 0) reaped = true;
+            else usleep(1000);
+        }
+        if (!reaped) {
+            kill(child_pid, SIGKILL);
+            waitpid(child_pid, nullptr, 0);
+        }
+        child_pid = 0;
+    }
 #endif
 }
 
@@ -307,6 +334,7 @@ void ZGTerminal::_feed(const uint8_t *data, int len) {
                     csi_private = false;
                     parse_state = ST_CSI;
                 } else if (b == ']') {
+                    osc_buf.clear();
                     parse_state = ST_OSC;
                 } else if (b == '7') {
                     saved_x = cur_x; saved_y = cur_y; parse_state = ST_NORMAL;
@@ -344,13 +372,18 @@ void ZGTerminal::_feed(const uint8_t *data, int len) {
 
             case ST_OSC: {
                 if (b == 0x07) {
+                    _handle_osc();
                     parse_state = ST_NORMAL;
                 } else if (b == 0x1B) {
                     parse_state = ST_OSC_ESC;
+                } else if (osc_buf.size() < 4096) {
+                    osc_buf.push_back((char)b);
                 }
             } break;
 
             case ST_OSC_ESC: {
+                // ST terminator is ESC '\'; anything else just ends the OSC.
+                if (b == '\\') _handle_osc();
                 parse_state = ST_NORMAL;
             } break;
         }
@@ -492,6 +525,19 @@ void ZGTerminal::_handle_csi(char final) {
             }
         } break;
         default: break;
+    }
+}
+
+void ZGTerminal::_handle_osc() {
+    // OSC payload is "Ps;Pt". We only care about title commands: 0, 1, 2.
+    size_t sep = osc_buf.find(';');
+    if (sep == std::string::npos) return;
+    std::string ps = osc_buf.substr(0, sep);
+    if (ps != "0" && ps != "1" && ps != "2") return;
+    String title = String::utf8(osc_buf.c_str() + sep + 1);
+    if (title != terminal_title) {
+        terminal_title = title;
+        emit_signal("title_changed", terminal_title);
     }
 }
 
@@ -964,11 +1010,6 @@ void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
         _snap_to_bottom();
         _send(seq);
         accept_event();
-    }
-}
-
-void ZGTerminal::_sigchld_handler(int signum) {
-    while (waitpid(-1, nullptr, WNOHANG) > 0) {
     }
 }
 

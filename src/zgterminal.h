@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <vector>
 
 namespace godot {
@@ -80,6 +81,10 @@ private:
     bool csi_has_digit;
     bool csi_private;
 
+    // OSC accumulation (window title etc.)
+    std::string osc_buf;
+    String terminal_title;
+
     // UTF-8 decoding (NORMAL state)
     int utf8_remaining;
     char32_t utf8_acc;
@@ -110,6 +115,7 @@ private:
     void _push_scrollback_line(int grid_row);
 
     void _handle_csi(char final);
+    void _handle_osc();
     void _handle_sgr();
     void _erase_display(int mode);
     void _erase_line(int mode);
@@ -138,8 +144,6 @@ private:
     void _paste_clipboard();
 
     void _send(const String &s);
-
-    static void _sigchld_handler(int signum);
 
 protected:
     static void _bind_methods();

@@ -21,9 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |---|---|
 | `/home/zed/dev/zeds-godot-terminal` | **Source repo root** — C++ source, addon, build system, this doc |
 | `/home/zed/dev/zeds-godot-terminal/demo/` | Godot test project inside the repo |
-| `/home/zed/dev/godotterminal` | Development copy with `godot-cpp/` pre-cloned and built |
-| `/home/zed/dev/kitty_terminal_test` | **Legacy** — old X11 kitty-embedding approach (abandoned) |
-| `/home/zed/kitty-terminal-test` | **Legacy** — old standalone test project (replaced by `demo/`) |
+| `/home/zed/dev/godotterminal` | Development copy with `godot-cpp/` pre-cloned and built (use for builds) |
+| `/home/zed/kitty-terminal-test` | **Active manual test project** — synced with the source git and the `zgt-bin` release binaries |
 
 ## Build
 
@@ -81,9 +80,9 @@ Two cooperating layers:
 1. **GDScript editor plugin** (`addons/zgt/plugin.gd`) — an `@tool EditorPlugin`. On `_enter_tree` it loads the GDExtension via `GDExtensionManager` (path `res://zgt.gdextension`), instantiates `ZGTerminal` through `ClassDB.instantiate()`, wraps it in a panel (the panel gets `custom_minimum_size.y = 300` so it opens at a usable height, plus a "Restart" button calling `stop_terminal()`/`start_terminal()`), and registers it as the "ZGT" bottom-panel control.
 
 2. **Native `ZGTerminal` class** (`src/zgterminal.cpp/.h`) — a `Control` that is a small terminal emulator:
-   - **PTY/shell**: `_start_shell()` (on `NOTIFICATION_READY`) sizes the grid from the Control's pixel size, then `forkpty()`s and `execlp`s `$SHELL -i` with `TERM=xterm-256color`, `COLORTERM=truecolor`. Master fd is non-blocking.
+   - **PTY/shell**: `_start_shell()` (on `NOTIFICATION_READY`) sizes the grid from the Control's pixel size, then `forkpty()`s and `execlp`s `$SHELL -i` with `TERM=xterm-256color`, `COLORTERM=truecolor`. The project root is resolved **in the parent** (`ProjectSettings::globalize_path("res://")`) and the child `chdir()`s into it and exports `GODOT_PROJECT_PATH`, so the shell — and tools like `claude` — start inside the project. Master fd is non-blocking. **Child reaping**: there is deliberately **no process-wide `SIGCHLD` handler** — this Control runs inside the Godot editor and a global `waitpid(-1)` would steal the exit status of the editor's own subprocesses (running the game, asset imports). `_stop_shell()` reaps only its own child (`SIGTERM` → ~100ms grace → `SIGKILL` → `waitpid(child_pid)`).
    - **Read loop**: `set_process(true)` → `NOTIFICATION_PROCESS` drains the master fd each frame and feeds bytes to the parser; `queue_redraw()` on change.
-   - **Parser** (`_feed`): a byte state machine (`ST_NORMAL/ESC/CSI/OSC/...`) with UTF-8 decoding. Handles a practical VT/ANSI subset: cursor moves, erase (ED/EL), insert/delete lines & chars, scroll region (DECSTBM), SGR (16/256-color **and 24-bit truecolor**, bold/inverse/underline), alt screen (`?1049`/`?47`), cursor visibility (`?25`), bracketed paste (`?2004`), application cursor keys (DECCKM `?1`). It **replies** to host queries — DSR cursor-position (`ESC[6n`) and Device Attributes (`ESC[c`) — which is required or shells like **fish** hang/misrender.
+   - **Parser** (`_feed`): a byte state machine (`ST_NORMAL/ESC/CSI/OSC/...`) with UTF-8 decoding. Handles a practical VT/ANSI subset: cursor moves, erase (ED/EL), insert/delete lines & chars, scroll region (DECSTBM), SGR (16/256-color **and 24-bit truecolor**, bold/inverse/underline), alt screen (`?1049`/`?47`), cursor visibility (`?25`), bracketed paste (`?2004`), application cursor keys (DECCKM `?1`). It **replies** to host queries — DSR cursor-position (`ESC[6n`) and Device Attributes (`ESC[c`) — which is required or shells like **fish** hang/misrender. OSC title commands (`ESC]0;`/`1;`/`2;`, BEL- or ST-terminated, capped at 4 KB) are captured into `terminal_title` and emit the `title_changed(String)` signal, which `plugin.gd` shows in the panel header.
    - **Grid model**: `primary`/`alt` are `std::vector<TermCell>`; `active()` selects the current one. `TermCell` = glyph + `int32_t` fg/bg + flags. Color encoding: `-1` default, `0..255` palette, or `ZGT_TRUECOLOR | 0xRRGGBB`. `_ansi_color()` resolves it.
    - **Scrollback**: when a line scrolls off the top of the primary screen, `_scroll_up()` pushes it into a `std::deque` (`scrollback_max` lines). `scroll_offset` is how many lines the view is scrolled up; the renderer maps each screen row to a "virtual index" across scrollback+grid (`_viewport_top_vi()`). Mouse wheel scrolls the view on the primary screen, or sends arrow keys on the alt screen.
    - **Selection/clipboard**: left-drag sets a selection (stored as virtual line + column); on release `_copy_selection()` writes to the system clipboard via `DisplayServer`. `Ctrl+Shift+C` copies, `Ctrl+Shift+V` / middle-click paste (wrapped in bracketed-paste markers when the mode is on).
@@ -97,6 +96,10 @@ Two cooperating layers:
 
 `src/register_types.cpp` is the entry point. `zgt_library_init` (the `entry_symbol` in `zgt.gdextension`) registers `ZGTerminal` at `MODULE_INITIALIZATION_LEVEL_SCENE`. New native classes go in `zgt_initialize_types()` with sources under `src/` (auto-globbed by `SConstruct`). Note: a class overriding a virtual like `_gui_input` must declare it `public` or godot-cpp's `register_virtuals` fails to compile.
 
+## Direction
+
+The goal is a **single, excellent built-in terminal** — not an editor-integration framework. (An MCP-server / scene-tree-introspection angle was considered and deliberately dropped.) Effort goes into terminal quality and compatibility so tools like `claude` run well in the panel.
+
 ## Known limitations / next ideas
 
-Truecolor, scrollback+wheel, selection/copy, bracketed paste, and fish-compat queries are done. Not yet: scrollback search, configurable font/size/theme, `sixel`/image protocols, OSC 52 clipboard, reflow of scrollback on resize (only the live grid reflows).
+Done: truecolor, scrollback+wheel, selection/copy, bracketed paste, fish-compat queries, shell starts in the project root, OSC window-title in the panel header, and per-child reaping (no global `SIGCHLD`). **Next up: mouse tracking** (`?1000/1002/1003` + SGR `?1006`) so TUIs like `claude` get click/scroll. Not yet: scrollback search, configurable font/size/theme, `sixel`/image protocols, OSC 52 clipboard, reflow of scrollback on resize (only the live grid reflows).
