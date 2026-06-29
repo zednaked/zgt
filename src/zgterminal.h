@@ -70,6 +70,9 @@ private:
 
     // Modes
     bool bracketed_paste;
+    int mouse_report;   // 0 = off, else 1000/1002/1003 (which events to report)
+    bool mouse_sgr;     // ?1006 — SGR-encoded mouse reports
+    bool focus_report;  // ?1004 — send ESC[I / ESC[O on focus change
 
     // Scroll region (inclusive rows)
     int scroll_top, scroll_bottom;
@@ -130,6 +133,8 @@ private:
     void _recompute_grid();
     void _set_winsize();
     void _load_font();
+    void _set_font_size(int s);
+    void _mouse_report(int code, const Vector2 &local, bool pressed);
     Color _ansi_color(int32_t idx, bool is_fg) const;
 
     // view / selection / clipboard
@@ -144,6 +149,7 @@ private:
     void _paste_clipboard();
 
     void _send(const String &s);
+    void _send_raw(const uint8_t *bytes, int n);
 
 protected:
     static void _bind_methods();

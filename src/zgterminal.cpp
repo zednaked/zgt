@@ -62,6 +62,7 @@ ZGTerminal::ZGTerminal()
       cursor_visible(true),
       cur_fg(-1), cur_bg(-1), cur_flags(0),
       bracketed_paste(false),
+      mouse_report(0), mouse_sgr(false), focus_report(false),
       scroll_top(0), scroll_bottom(23),
       parse_state(ST_NORMAL),
       csi_cur(0), csi_has_digit(false), csi_private(false),
@@ -130,6 +131,15 @@ void ZGTerminal::_load_font() {
     }
 }
 
+void ZGTerminal::_set_font_size(int s) {
+    s = std::max(6, std::min(48, s));
+    if (s == font_size) return;
+    font_size = s;
+    _load_font();      // re-derives cell_w/cell_h/ascent from the new size
+    _recompute_grid(); // reflow cols/rows + push the new winsize
+    queue_redraw();
+}
+
 void ZGTerminal::_recompute_grid() {
     Vector2 sz = get_size();
     int new_cols = std::max(1, (int)(sz.x / cell_w));
@@ -181,6 +191,12 @@ void ZGTerminal::_set_winsize() {
 void ZGTerminal::_start_shell() {
 #ifdef LINUX_ENABLED
     if (master_fd >= 0) return;
+
+    // Fresh shell: drop any sticky terminal modes left over from a prior session.
+    mouse_report = 0;
+    mouse_sgr = false;
+    focus_report = false;
+    bracketed_paste = false;
 
     _load_font();
     _recompute_grid();
@@ -543,15 +559,24 @@ void ZGTerminal::_handle_osc() {
 
 void ZGTerminal::_set_mode(bool enable) {
     if (!csi_private) return;
-    int p = csi_params.empty() ? 0 : csi_params[0];
-    switch (p) {
-        case 1: s_app_cursor_keys = enable; break;     // DECCKM
-        case 25: cursor_visible = enable; break;
-        case 47:
-        case 1047:
-        case 1049: _switch_alt(enable); break;
-        case 2004: bracketed_paste = enable; break;
-        default: break;
+    // A single sequence may carry several modes (e.g. htop sends ESC[?1006;1000h),
+    // so handle every parameter, not just the first.
+    for (size_t i = 0; i < csi_params.size(); i++) {
+        int p = csi_params[i];
+        switch (p) {
+            case 1: s_app_cursor_keys = enable; break;     // DECCKM
+            case 25: cursor_visible = enable; break;
+            case 47:
+            case 1047:
+            case 1049: _switch_alt(enable); break;
+            case 1000:                                     // report button press/release
+            case 1002:                                     // + button-held motion
+            case 1003: mouse_report = enable ? p : 0; break; // + any motion
+            case 1004: focus_report = enable; break;       // focus in/out reporting
+            case 1006: mouse_sgr = enable; break;          // SGR-encoded reports
+            case 2004: bracketed_paste = enable; break;
+            default: break;
+        }
     }
 }
 
@@ -817,7 +842,11 @@ void ZGTerminal::_notification(int p_what) {
             queue_redraw();
             break;
         case NOTIFICATION_FOCUS_ENTER:
+            if (focus_report) _send(String::chr(0x1B) + "[I");
+            queue_redraw();
+            break;
         case NOTIFICATION_FOCUS_EXIT:
+            if (focus_report) _send(String::chr(0x1B) + "[O");
             queue_redraw();
             break;
         case NOTIFICATION_DRAW: {
@@ -911,36 +940,94 @@ void ZGTerminal::_send(const String &s) {
 #endif
 }
 
+// Map a Godot mouse button to its base xterm mouse-report code.
+static int zgt_mouse_base_code(MouseButton b) {
+    switch (b) {
+        case MOUSE_BUTTON_LEFT: return 0;
+        case MOUSE_BUTTON_MIDDLE: return 1;
+        case MOUSE_BUTTON_RIGHT: return 2;
+        case MOUSE_BUTTON_WHEEL_UP: return 64;
+        case MOUSE_BUTTON_WHEEL_DOWN: return 65;
+        default: return 0;
+    }
+}
+
+void ZGTerminal::_mouse_report(int code, const Vector2 &local, bool pressed) {
+    int col = std::min(cols - 1, std::max(0, (int)(local.x / cell_w)));
+    int row = std::min(rows - 1, std::max(0, (int)(local.y / cell_h)));
+    if (mouse_sgr) {
+        _send(String::chr(0x1B) + "[<" + String::num_int64(code) + ";" +
+            String::num_int64(col + 1) + ";" + String::num_int64(row + 1) +
+            (pressed ? "M" : "m"));
+    } else {
+        // Legacy X10/normal encoding: each value offset by 32, release = button 3.
+        // Sent as raw bytes (values can exceed 127, which String::utf8() would mangle).
+        int cb = pressed ? code : ((code & 0xFC) | 3);
+        uint8_t seq[6] = {
+            0x1B, '[', 'M',
+            (uint8_t)std::min(255, (cb & 0xFF) + 32),
+            (uint8_t)std::min(255, col + 1 + 32),
+            (uint8_t)std::min(255, row + 1 + 32),
+        };
+        _send_raw(seq, 6);
+    }
+}
+
+void ZGTerminal::_send_raw(const uint8_t *bytes, int n) {
+#ifdef LINUX_ENABLED
+    if (master_fd < 0 || n <= 0) return;
+    int off = 0;
+    while (off < n) {
+        ssize_t w = write(master_fd, bytes + off, n - off);
+        if (w <= 0) break;
+        off += w;
+    }
+#endif
+}
+
 void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
     // mouse buttons
     Ref<InputEventMouseButton> mb = p_event;
     if (mb.is_valid()) {
         MouseButton b = mb->get_button_index();
+        // Shift forces the terminal's own selection/scroll even while an app is
+        // tracking the mouse (xterm/kitty convention).
+        bool report = (mouse_report != 0) && !mb->is_shift_pressed();
+        int mods = (mb->is_shift_pressed() ? 4 : 0) |
+                   (mb->is_alt_pressed() ? 8 : 0) |
+                   (mb->is_ctrl_pressed() ? 16 : 0);
+
         if (mb->is_pressed()) {
-            if (b == MOUSE_BUTTON_WHEEL_UP) {
-                if (using_alt) { for (int i = 0; i < 3; i++) _send(String::chr(0x1B) + "OA"); }
-                else _scroll_view(3);
+            if (b == MOUSE_BUTTON_WHEEL_UP || b == MOUSE_BUTTON_WHEEL_DOWN) {
+                if (report) {
+                    _mouse_report(zgt_mouse_base_code(b) + mods, mb->get_position(), true);
+                } else if (using_alt) {
+                    const char *ar = (b == MOUSE_BUTTON_WHEEL_UP) ? "OA" : "OB";
+                    for (int i = 0; i < 3; i++) _send(String::chr(0x1B) + ar);
+                } else {
+                    _scroll_view(b == MOUSE_BUTTON_WHEEL_UP ? 3 : -3);
+                }
                 accept_event();
                 return;
             }
-            if (b == MOUSE_BUTTON_WHEEL_DOWN) {
-                if (using_alt) { for (int i = 0; i < 3; i++) _send(String::chr(0x1B) + "OB"); }
-                else _scroll_view(-3);
-                accept_event();
-                return;
-            }
-            if (b == MOUSE_BUTTON_LEFT) {
+            if (b == MOUSE_BUTTON_LEFT || b == MOUSE_BUTTON_MIDDLE || b == MOUSE_BUTTON_RIGHT) {
                 grab_focus();
-                _begin_selection(mb->get_position());
-                accept_event();
-                return;
-            }
-            if (b == MOUSE_BUTTON_MIDDLE) {
-                _paste_clipboard();
+                if (report) {
+                    _mouse_report(zgt_mouse_base_code(b) + mods, mb->get_position(), true);
+                } else if (b == MOUSE_BUTTON_LEFT) {
+                    _begin_selection(mb->get_position());
+                } else if (b == MOUSE_BUTTON_MIDDLE) {
+                    _paste_clipboard();
+                }
                 accept_event();
                 return;
             }
         } else {
+            if (report && (b == MOUSE_BUTTON_LEFT || b == MOUSE_BUTTON_MIDDLE || b == MOUSE_BUTTON_RIGHT)) {
+                _mouse_report(zgt_mouse_base_code(b) + mods, mb->get_position(), false);
+                accept_event();
+                return;
+            }
             if (b == MOUSE_BUTTON_LEFT) {
                 selecting = false;
                 if (has_sel) _copy_selection();
@@ -951,9 +1038,28 @@ void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
         return;
     }
 
-    // mouse motion (drag-select)
+    // mouse motion
     Ref<InputEventMouseMotion> mm = p_event;
     if (mm.is_valid()) {
+        bool report = (mouse_report != 0) && !mm->is_shift_pressed();
+        if (report) {
+            BitField<MouseButtonMask> mask = mm->get_button_mask();
+            bool left = mask.has_flag(MOUSE_BUTTON_MASK_LEFT);
+            bool middle = mask.has_flag(MOUSE_BUTTON_MASK_MIDDLE);
+            bool right = mask.has_flag(MOUSE_BUTTON_MASK_RIGHT);
+            bool any_button = left || middle || right;
+            // 1003 reports all motion; 1002 only while a button is held.
+            if (mouse_report == 1003 || (mouse_report == 1002 && any_button)) {
+                int base = 32; // motion flag
+                if (left) base += 0;
+                else if (middle) base += 1;
+                else if (right) base += 2;
+                else base += 3; // no button (1003 hover)
+                _mouse_report(base, mm->get_position(), true);
+            }
+            accept_event();
+            return;
+        }
         if (selecting) {
             _update_selection(mm->get_position());
             accept_event();
@@ -973,6 +1079,11 @@ void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
     // copy / paste shortcuts
     if (ctrl && shift && kc == KEY_C) { _copy_selection(); accept_event(); return; }
     if (ctrl && shift && kc == KEY_V) { _paste_clipboard(); accept_event(); return; }
+
+    // font zoom (kitty-style)
+    if (ctrl && shift && (kc == KEY_EQUAL || kc == KEY_PLUS)) { _set_font_size(font_size + 1); accept_event(); return; }
+    if (ctrl && shift && (kc == KEY_MINUS || kc == KEY_UNDERSCORE)) { _set_font_size(font_size - 1); accept_event(); return; }
+    if (ctrl && shift && kc == KEY_0) { _set_font_size(14); accept_event(); return; }
 
     String seq;
     String ck = s_app_cursor_keys ? "O" : "[";
