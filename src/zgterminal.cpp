@@ -39,10 +39,19 @@ enum {
 static bool s_app_cursor_keys = false; // DECCKM, per-process is fine (single terminal)
 
 static const char *kFontCandidates[] = {
+    // Prefer a Nerd Font: full box-drawing + Powerline + icon glyphs, so TUIs
+    // like `claude` render their borders and symbols correctly. "Mono" variant
+    // keeps every glyph (icons included) at a single cell width.
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+    "/usr/share/fonts/jetbrains-mono-nerd/JetBrainsMonoNerdFontMono-Regular.ttf",
+    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMonoNerdFontMono-Regular.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+    "/usr/share/fonts/TTF/CaskaydiaCoveNerdFontMono-Regular.ttf",
+    // Plain monospace fallbacks (no icon/box-drawing guarantees).
+    "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
     "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
     "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
     nullptr,
 };
