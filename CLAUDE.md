@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **ZeDs Godot Terminal (ZGT)** — a Godot 4 GDExtension (C++) providing a built-in terminal emulator in the editor's bottom panel. The native `ZGTerminal` Control runs a real shell on a PTY and renders the character grid itself, so it works identically under X11 and Wayland. Linux only.
 
-> History: this started as a Kitty-window-embedding hack (reparenting an X11 `kitty` window into the editor). That is unreliable on Wayland compositors (e.g. Hyprland) because XWayland clients can't position their own windows, so it was replaced by a self-contained PTY terminal. The whole project was then renamed to "ZGT" (display name "ZeDs Godot Terminal"). Some external paths still carry the old `kitty` name (the test project dir `/home/zed/kitty-terminal-test`); that's cosmetic.
+> History: this started as a Kitty-window-embedding hack (reparenting an X11 `kitty` window into the editor). That is unreliable on Wayland compositors (e.g. Hyprland) because XWayland clients can't position their own windows, so it was replaced by a self-contained PTY terminal. The whole project was then renamed to "ZGT" (display name "ZeDs Godot Terminal"). The `demo/` directory is a ready-to-use test Godot project.
 
 ## Build & Setup
 
@@ -25,7 +25,7 @@ g++ -std=c++17 -fPIC -shared -O2 -DLINUX_ENABLED \
   -o bin/libzgt.linux.template_debug.x86_64.so
 ```
 
-No automated tests. To verify: build, open a Godot project that includes the extension, enable the **"ZeDs Godot Terminal"** plugin (Project Settings → Plugins), click the **"ZGT"** bottom-panel tab and type into the shell. `/home/zed/kitty-terminal-test` is a ready test project — after rebuilding, copy `src/*`, `bin/*.so`, and (if changed) `addons/zgt/*` into it. On Wayland, launch the editor with `--display-driver x11` or native; both work since nothing depends on the windowing system. Test a non-default shell with `SHELL=/usr/bin/fish godot --editor ...`.
+No automated tests. To verify: build, then copy `bin/*.so` into `demo/bin/`, open `demo/project.godot` in the editor, enable the **"ZeDs Godot Terminal"** plugin (Project Settings → Plugins), click the **"ZGT"** bottom-panel tab and type into the shell. On Wayland, launch the editor with `--display-driver x11` or native; both work since nothing depends on the windowing system. Test a non-default shell with `SHELL=/usr/bin/fish godot --editor ...`.
 
 `bin/`, `godot-cpp/`, and `.godot/` are gitignored. `godot-cpp` is pinned to branch `4.3` even though `compatibility_minimum` is `4.2`.
 
