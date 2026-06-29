@@ -59,16 +59,23 @@ private:
     int sel_a_line, sel_a_col;
     int sel_b_line, sel_b_col;
 
+    // Multi-click detection (double = word, triple = line)
+    uint64_t last_click_msec;
+    int last_click_vi, last_click_col;
+    int click_count;
+
     // Cursor + saved cursor
     int cur_x, cur_y;
     int saved_x, saved_y;
     bool cursor_visible;
+    int cursor_style;   // DECSCUSR: 0/1/2 block, 3/4 underline, 5/6 bar
 
     // Current pen attributes
     int32_t cur_fg, cur_bg;
     uint8_t cur_flags;
 
     // Modes
+    bool app_cursor_keys; // DECCKM (?1)
     bool bracketed_paste;
     int mouse_report;   // 0 = off, else 1000/1002/1003 (which events to report)
     bool mouse_sgr;     // ?1006 — SGR-encoded mouse reports
@@ -88,6 +95,10 @@ private:
     std::string osc_buf;
     String terminal_title;
 
+    // Scrollback search
+    String search_query;  // lowercased; empty = inactive
+    int search_vi;        // virtual line of the current match
+
     // UTF-8 decoding (NORMAL state)
     int utf8_remaining;
     char32_t utf8_acc;
@@ -96,6 +107,12 @@ private:
     Ref<Font> font;
     int font_size;
     float cell_w, cell_h, ascent;
+
+    // Theme (configurable via ProjectSettings "zgt/terminal/*")
+    Color cfg_bg, cfg_fg;
+    float cfg_opacity;
+    bool has_palette;
+    Color cfg_palette[16];
 
     // helpers
     std::vector<TermCell> &active();
@@ -133,6 +150,7 @@ private:
     void _recompute_grid();
     void _set_winsize();
     void _load_font();
+    void _load_theme();
     void _set_font_size(int s);
     void _mouse_report(int code, const Vector2 &local, bool pressed);
     Color _ansi_color(int32_t idx, bool is_fg) const;
@@ -147,6 +165,10 @@ private:
     bool _in_selection(int vi, int col) const;
     void _copy_selection();
     void _paste_clipboard();
+    void _select_word(int vi, int col);
+    void _select_line(int vi);
+    bool _url_at(int vi, int col, String &out) const;
+    void _cell_at(const Vector2 &local, int &vi, int &col) const;
 
     void _send(const String &s);
     void _send_raw(const uint8_t *bytes, int n);
@@ -164,6 +186,8 @@ public:
     // Public API used by the editor plugin.
     void start_terminal();
     void stop_terminal();
+    void search(const String &query, bool forward);
+    void clear_search();
 };
 
 }

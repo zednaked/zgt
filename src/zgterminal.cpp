@@ -6,7 +6,10 @@
 #include <godot_cpp/classes/input_event_key.hpp>
 #include <godot_cpp/classes/input_event_mouse_button.hpp>
 #include <godot_cpp/classes/input_event_mouse_motion.hpp>
+#include <godot_cpp/classes/marshalls.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -36,8 +39,6 @@ enum {
     ST_CHARSET,
 };
 
-static bool s_app_cursor_keys = false; // DECCKM, per-process is fine (single terminal)
-
 static const char *kFontCandidates[] = {
     // Prefer a Nerd Font: full box-drawing + Powerline + icon glyphs, so TUIs
     // like `claude` render their borders and symbols correctly. "Mono" variant
@@ -66,21 +67,24 @@ ZGTerminal::ZGTerminal()
       scroll_offset(0),
       selecting(false), has_sel(false),
       sel_a_line(0), sel_a_col(0), sel_b_line(0), sel_b_col(0),
+      last_click_msec(0), last_click_vi(-1), last_click_col(-1), click_count(0),
       cur_x(0), cur_y(0),
       saved_x(0), saved_y(0),
-      cursor_visible(true),
+      cursor_visible(true), cursor_style(0),
       cur_fg(-1), cur_bg(-1), cur_flags(0),
-      bracketed_paste(false),
+      app_cursor_keys(false), bracketed_paste(false),
       mouse_report(0), mouse_sgr(false), focus_report(false),
       scroll_top(0), scroll_bottom(23),
       parse_state(ST_NORMAL),
+      search_vi(-1),
       csi_cur(0), csi_has_digit(false), csi_private(false),
       utf8_remaining(0), utf8_acc(0),
-      font_size(14), cell_w(8.0f), cell_h(16.0f), ascent(12.0f) {
+      font_size(14), cell_w(8.0f), cell_h(16.0f), ascent(12.0f),
+      cfg_bg(0.11f, 0.11f, 0.13f), cfg_fg(0.85f, 0.85f, 0.85f),
+      cfg_opacity(1.0f), has_palette(false) {
     set_focus_mode(FOCUS_ALL);
     set_clip_contents(true);
     set_default_cursor_shape(CURSOR_IBEAM);
-    s_app_cursor_keys = false;
 }
 
 ZGTerminal::~ZGTerminal() {
@@ -90,8 +94,11 @@ ZGTerminal::~ZGTerminal() {
 void ZGTerminal::_bind_methods() {
     ClassDB::bind_method(D_METHOD("start_terminal"), &ZGTerminal::start_terminal);
     ClassDB::bind_method(D_METHOD("stop_terminal"), &ZGTerminal::stop_terminal);
+    ClassDB::bind_method(D_METHOD("search", "query", "forward"), &ZGTerminal::search);
+    ClassDB::bind_method(D_METHOD("clear_search"), &ZGTerminal::clear_search);
 
     ADD_SIGNAL(MethodInfo("title_changed", PropertyInfo(Variant::STRING, "title")));
+    ADD_SIGNAL(MethodInfo("search_requested"));
 }
 
 // ---------- grid helpers ----------
@@ -120,7 +127,22 @@ TermCell &ZGTerminal::cell(int x, int y) {
 // ---------- font / grid sizing ----------
 
 void ZGTerminal::_load_font() {
-    for (int i = 0; kFontCandidates[i]; i++) {
+    font.unref();
+
+    // A user-configured font path (ProjectSettings "zgt/terminal/font_path")
+    // takes priority over the built-in candidates.
+    ProjectSettings *ps = ProjectSettings::get_singleton();
+    if (ps && ps->has_setting("zgt/terminal/font_path")) {
+        String p = ps->get_setting("zgt/terminal/font_path");
+        if (!p.is_empty()) {
+            if (p.begins_with("res://") || p.begins_with("user://")) p = ps->globalize_path(p);
+            Ref<FontFile> f;
+            f.instantiate();
+            if (f->load_dynamic_font(p) == OK) font = f;
+        }
+    }
+
+    for (int i = 0; font.is_null() && kFontCandidates[i]; i++) {
         Ref<FontFile> f;
         f.instantiate();
         if (f->load_dynamic_font(kFontCandidates[i]) == OK) {
@@ -137,6 +159,25 @@ void ZGTerminal::_load_font() {
         ascent = font->get_ascent(font_size);
         if (cell_w < 1.0f) cell_w = 8.0f;
         if (cell_h < 1.0f) cell_h = 16.0f;
+    }
+}
+
+void ZGTerminal::_load_theme() {
+    ProjectSettings *ps = ProjectSettings::get_singleton();
+    if (!ps) return;
+    if (ps->has_setting("zgt/terminal/background_color"))
+        cfg_bg = ps->get_setting("zgt/terminal/background_color");
+    if (ps->has_setting("zgt/terminal/foreground_color"))
+        cfg_fg = ps->get_setting("zgt/terminal/foreground_color");
+    if (ps->has_setting("zgt/terminal/background_opacity"))
+        cfg_opacity = std::max(0.0f, std::min(1.0f, (float)(double)ps->get_setting("zgt/terminal/background_opacity")));
+    has_palette = false;
+    if (ps->has_setting("zgt/terminal/palette")) {
+        PackedColorArray pal = ps->get_setting("zgt/terminal/palette");
+        if (pal.size() == 16) {
+            for (int i = 0; i < 16; i++) cfg_palette[i] = pal[i];
+            has_palette = true;
+        }
     }
 }
 
@@ -206,7 +247,17 @@ void ZGTerminal::_start_shell() {
     mouse_sgr = false;
     focus_report = false;
     bracketed_paste = false;
+    app_cursor_keys = false;
+    cursor_style = 0;
 
+    // Apply the configured default font size (live zoom still overrides per session).
+    ProjectSettings *ps = ProjectSettings::get_singleton();
+    if (ps && ps->has_setting("zgt/terminal/font_size")) {
+        int fs = (int)ps->get_setting("zgt/terminal/font_size");
+        if (fs >= 6 && fs <= 48) font_size = fs;
+    }
+
+    _load_theme();
     _load_font();
     _recompute_grid();
 
@@ -527,6 +578,9 @@ void ZGTerminal::_handle_csi(char final) {
             if (scroll_top >= scroll_bottom) { scroll_top = 0; scroll_bottom = rows - 1; }
             cur_x = 0; cur_y = scroll_top;
         } break;
+        case 'q': // DECSCUSR — cursor shape (the SP intermediate is skipped by the parser)
+            if (!csi_private) cursor_style = getp(0, 1);
+            break;
         case 'h': _set_mode(true); break;
         case 'l': _set_mode(false); break;
         case 's': saved_x = cur_x; saved_y = cur_y; break;
@@ -554,15 +608,26 @@ void ZGTerminal::_handle_csi(char final) {
 }
 
 void ZGTerminal::_handle_osc() {
-    // OSC payload is "Ps;Pt". We only care about title commands: 0, 1, 2.
+    // OSC payload is "Ps;Pt".
     size_t sep = osc_buf.find(';');
     if (sep == std::string::npos) return;
     std::string ps = osc_buf.substr(0, sep);
-    if (ps != "0" && ps != "1" && ps != "2") return;
-    String title = String::utf8(osc_buf.c_str() + sep + 1);
-    if (title != terminal_title) {
-        terminal_title = title;
-        emit_signal("title_changed", terminal_title);
+
+    if (ps == "0" || ps == "1" || ps == "2") { // window title
+        String title = String::utf8(osc_buf.c_str() + sep + 1);
+        if (title != terminal_title) {
+            terminal_title = title;
+            emit_signal("title_changed", terminal_title);
+        }
+    } else if (ps == "52") { // clipboard set: "52;<sel>;<base64>"
+        size_t sep2 = osc_buf.find(';', sep + 1);
+        if (sep2 == std::string::npos) return;
+        String b64 = String::utf8(osc_buf.c_str() + sep2 + 1);
+        if (b64.is_empty() || b64 == "?") return; // ignore clipboard *queries*
+        String text = Marshalls::get_singleton()->base64_to_utf8(b64);
+        if (!text.is_empty()) {
+            DisplayServer::get_singleton()->clipboard_set(text);
+        }
     }
 }
 
@@ -573,7 +638,7 @@ void ZGTerminal::_set_mode(bool enable) {
     for (size_t i = 0; i < csi_params.size(); i++) {
         int p = csi_params[i];
         switch (p) {
-            case 1: s_app_cursor_keys = enable; break;     // DECCKM
+            case 1: app_cursor_keys = enable; break;       // DECCKM
             case 25: cursor_visible = enable; break;
             case 47:
             case 1047:
@@ -709,7 +774,8 @@ Color ZGTerminal::_ansi_color(int32_t idx, bool is_fg) const {
         Color(0.4, 0.6, 1.0), Color(1.0, 0.33, 1.0), Color(0.33, 1.0, 1.0), Color(1.0, 1.0, 1.0),
     };
     if (idx < 0) {
-        return is_fg ? Color(0.85, 0.85, 0.85) : Color(0.11, 0.11, 0.13);
+        if (is_fg) return cfg_fg;
+        return Color(cfg_bg.r, cfg_bg.g, cfg_bg.b, cfg_opacity);
     }
     if (idx & ZGT_TRUECOLOR) {
         float r = ((idx >> 16) & 0xFF) / 255.0f;
@@ -717,7 +783,7 @@ Color ZGTerminal::_ansi_color(int32_t idx, bool is_fg) const {
         float b = (idx & 0xFF) / 255.0f;
         return Color(r, g, b);
     }
-    if (idx < 16) return base16[idx];
+    if (idx < 16) return has_palette ? cfg_palette[idx] : base16[idx];
     if (idx < 232) {
         int i = idx - 16;
         int r = i / 36, g = (i / 6) % 6, b = i % 6;
@@ -781,6 +847,88 @@ void ZGTerminal::_update_selection(const Vector2 &local) {
     sel_b_col = sx;
     has_sel = (sel_b_line != sel_a_line || sel_b_col != sel_a_col);
     queue_redraw();
+}
+
+void ZGTerminal::_cell_at(const Vector2 &local, int &vi, int &col) const {
+    col = std::min(cols - 1, std::max(0, (int)(local.x / cell_w)));
+    int sy = std::min(rows - 1, std::max(0, (int)(local.y / cell_h)));
+    vi = _viewport_top_vi() + sy;
+}
+
+static bool zgt_is_word_char(char32_t c) {
+    if (c == 0 || c == ' ') return false;
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) return true;
+    for (const char *p = "._-/~:@%+=#?&"; *p; p++) if (c == (char32_t)*p) return true;
+    return c > 127; // non-ASCII counts as part of a word
+}
+
+void ZGTerminal::_select_word(int vi, int col) {
+    std::vector<TermCell> line;
+    _get_line_cells(vi, line);
+    int n = (int)line.size();
+    if (n == 0) return;
+    if (col >= n) col = n - 1;
+    if (col < 0) col = 0;
+    int l = col, r = col;
+    if (zgt_is_word_char(line[col].ch)) {
+        while (l > 0 && zgt_is_word_char(line[l - 1].ch)) l--;
+        while (r < n - 1 && zgt_is_word_char(line[r + 1].ch)) r++;
+    }
+    sel_a_line = sel_b_line = vi;
+    sel_a_col = l;
+    sel_b_col = r;
+    has_sel = true;
+    _copy_selection();
+    queue_redraw();
+}
+
+void ZGTerminal::_select_line(int vi) {
+    std::vector<TermCell> line;
+    _get_line_cells(vi, line);
+    int n = (int)line.size();
+    int last = 0;
+    for (int i = 0; i < n; i++)
+        if (line[i].ch != ' ' && line[i].ch != 0) last = i;
+    sel_a_line = sel_b_line = vi;
+    sel_a_col = 0;
+    sel_b_col = last;
+    has_sel = true;
+    _copy_selection();
+    queue_redraw();
+}
+
+bool ZGTerminal::_url_at(int vi, int col, String &out) const {
+    std::vector<TermCell> line;
+    _get_line_cells(vi, line);
+    int n = (int)line.size();
+    if (col < 0 || col >= n) return false;
+    char32_t here = line[col].ch;
+    if (here <= ' ' || here == 0) return false;
+    int l = col, r = col;
+    while (l > 0 && line[l - 1].ch > ' ') l--;
+    while (r < n - 1 && line[r + 1].ch > ' ') r++;
+    String tok;
+    for (int i = l; i <= r; i++) tok += String::chr(line[i].ch);
+    // trim trailing punctuation that's usually not part of the link
+    while (tok.length() > 0) {
+        char32_t last = tok[tok.length() - 1];
+        if (last == ')' || last == ']' || last == '.' || last == ',' ||
+                last == ';' || last == ':' || last == '!' || last == '?' ||
+                last == '"' || last == '\'' || last == '>') {
+            tok = tok.substr(0, tok.length() - 1);
+        } else {
+            break;
+        }
+    }
+    if (tok.begins_with("http://") || tok.begins_with("https://") || tok.begins_with("ftp://")) {
+        out = tok;
+        return true;
+    }
+    if (tok.begins_with("www.")) {
+        out = "https://" + tok;
+        return true;
+    }
+    return false;
 }
 
 bool ZGTerminal::_in_selection(int vi, int col) const {
@@ -865,8 +1013,10 @@ void ZGTerminal::_notification(int p_what) {
             int top_vi = _viewport_top_vi();
             int n_back = (int)scrollback.size();
             Color sel_color(0.20, 0.40, 0.85, 0.55);
+            int qlen = search_query.length();
 
             std::vector<TermCell> rowbuf;
+            std::vector<bool> hl;
             for (int y = 0; y < rows; y++) {
                 int vi = top_vi + y;
                 const TermCell *line = nullptr;
@@ -882,6 +1032,24 @@ void ZGTerminal::_notification(int p_what) {
                     }
                 }
 
+                // Search highlight mask for this row.
+                hl.clear();
+                if (qlen > 0 && line && line_len > 0) {
+                    String text;
+                    for (int x = 0; x < line_len; x++)
+                        text += String::chr(line[x].ch == 0 ? ' ' : line[x].ch);
+                    String lt = text.to_lower();
+                    int pos = lt.find(search_query);
+                    if (pos != -1) {
+                        hl.assign(line_len, false);
+                        while (pos != -1) {
+                            for (int k = 0; k < qlen && pos + k < line_len; k++) hl[pos + k] = true;
+                            pos = lt.find(search_query, pos + qlen);
+                        }
+                    }
+                }
+                bool current_match = (qlen > 0 && vi == search_vi);
+
                 float py = y * cell_h;
                 for (int x = 0; x < cols; x++) {
                     float px = x * cell_w;
@@ -894,6 +1062,11 @@ void ZGTerminal::_notification(int p_what) {
 
                     if (bg >= 0 || (cl.flags & TF_INVERSE)) {
                         draw_rect(Rect2(px, py, cell_w + 1, cell_h), _ansi_color(bg, false), true);
+                    }
+                    if (!hl.empty() && x < (int)hl.size() && hl[x]) {
+                        Color hc = current_match ? Color(1.0, 0.55, 0.0, 0.65)
+                                                 : Color(0.95, 0.85, 0.1, 0.45);
+                        draw_rect(Rect2(px, py, cell_w + 1, cell_h), hc, true);
                     }
                     if (_in_selection(vi, x)) {
                         draw_rect(Rect2(px, py, cell_w + 1, cell_h), sel_color, true);
@@ -914,11 +1087,19 @@ void ZGTerminal::_notification(int p_what) {
                 float py = cur_y * cell_h;
                 Color cc = _ansi_color(-1, true);
                 if (has_focus()) {
-                    draw_rect(Rect2(px, py, cell_w, cell_h), cc, true);
-                    const TermCell &cl = cell(cur_x, cur_y);
-                    if (cl.ch != ' ' && cl.ch != 0) {
-                        draw_char(font, Vector2(px, py + ascent), String::chr(cl.ch),
-                            font_size, _ansi_color(-1, false));
+                    if (cursor_style <= 2) {            // block
+                        draw_rect(Rect2(px, py, cell_w, cell_h), cc, true);
+                        const TermCell &cl = cell(cur_x, cur_y);
+                        if (cl.ch != ' ' && cl.ch != 0) {
+                            draw_char(font, Vector2(px, py + ascent), String::chr(cl.ch),
+                                font_size, _ansi_color(-1, false));
+                        }
+                    } else if (cursor_style <= 4) {     // underline
+                        float h = std::max(2.0f, cell_h * 0.12f);
+                        draw_rect(Rect2(px, py + cell_h - h, cell_w, h), cc, true);
+                    } else {                            // bar
+                        float w = std::max(2.0f, cell_w * 0.15f);
+                        draw_rect(Rect2(px, py, w, cell_h), cc, true);
                     }
                 } else {
                     draw_rect(Rect2(px, py, cell_w, cell_h), cc, false, 1.0);
@@ -1019,12 +1200,48 @@ void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
                 accept_event();
                 return;
             }
-            if (b == MOUSE_BUTTON_LEFT || b == MOUSE_BUTTON_MIDDLE || b == MOUSE_BUTTON_RIGHT) {
+            if (b == MOUSE_BUTTON_LEFT) {
+                grab_focus();
+                int vi, col;
+                _cell_at(mb->get_position(), vi, col);
+                // Ctrl+click opens a URL under the cursor (kitty-style).
+                String url;
+                if (mb->is_ctrl_pressed() && _url_at(vi, col, url)) {
+                    OS::get_singleton()->shell_open(url);
+                    accept_event();
+                    return;
+                }
+                if (report) {
+                    _mouse_report(zgt_mouse_base_code(b) + mods, mb->get_position(), true);
+                    accept_event();
+                    return;
+                }
+                // Multi-click: 2 = word, 3 = line, otherwise start a drag selection.
+                uint64_t now = Time::get_singleton()->get_ticks_msec();
+                if (now - last_click_msec < 400 && vi == last_click_vi && col == last_click_col) {
+                    click_count++;
+                } else {
+                    click_count = 1;
+                }
+                last_click_msec = now;
+                last_click_vi = vi;
+                last_click_col = col;
+                if (click_count == 2) {
+                    selecting = false;
+                    _select_word(vi, col);
+                } else if (click_count >= 3) {
+                    selecting = false;
+                    _select_line(vi);
+                } else {
+                    _begin_selection(mb->get_position());
+                }
+                accept_event();
+                return;
+            }
+            if (b == MOUSE_BUTTON_MIDDLE || b == MOUSE_BUTTON_RIGHT) {
                 grab_focus();
                 if (report) {
                     _mouse_report(zgt_mouse_base_code(b) + mods, mb->get_position(), true);
-                } else if (b == MOUSE_BUTTON_LEFT) {
-                    _begin_selection(mb->get_position());
                 } else if (b == MOUSE_BUTTON_MIDDLE) {
                     _paste_clipboard();
                 }
@@ -1094,8 +1311,11 @@ void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
     if (ctrl && shift && (kc == KEY_MINUS || kc == KEY_UNDERSCORE)) { _set_font_size(font_size - 1); accept_event(); return; }
     if (ctrl && shift && kc == KEY_0) { _set_font_size(14); accept_event(); return; }
 
+    // scrollback search
+    if (ctrl && shift && kc == KEY_F) { emit_signal("search_requested"); accept_event(); return; }
+
     String seq;
-    String ck = s_app_cursor_keys ? "O" : "[";
+    String ck = app_cursor_keys ? "O" : "[";
 
     switch (kc) {
         case KEY_ENTER:
@@ -1138,5 +1358,44 @@ void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
 void ZGTerminal::start_terminal() { _start_shell(); }
 
 void ZGTerminal::stop_terminal() { _stop_shell(); }
+
+void ZGTerminal::search(const String &query, bool forward) {
+    search_query = query.to_lower();
+    if (search_query.is_empty()) {
+        search_vi = -1;
+        queue_redraw();
+        return;
+    }
+    int total = (int)scrollback.size() + rows;
+    if (total <= 0) return;
+    int start = (search_vi >= 0 && search_vi < total) ? search_vi : total - 1;
+    std::vector<TermCell> line;
+    for (int step = 1; step <= total; step++) {
+        int vi = forward ? (start + step) : (start - step);
+        while (vi < 0) vi += total;
+        while (vi >= total) vi -= total;
+        _get_line_cells(vi, line);
+        String text;
+        for (size_t i = 0; i < line.size(); i++)
+            text += String::chr(line[i].ch == 0 ? ' ' : line[i].ch);
+        if (text.to_lower().find(search_query) != -1) {
+            search_vi = vi;
+            // Bring the match roughly to the middle of the viewport.
+            int off = (int)scrollback.size() - vi + rows / 2;
+            if (off < 0) off = 0;
+            if (off > (int)scrollback.size()) off = (int)scrollback.size();
+            scroll_offset = off;
+            queue_redraw();
+            return;
+        }
+    }
+    queue_redraw(); // no match: keep highlighting whatever is on screen
+}
+
+void ZGTerminal::clear_search() {
+    search_query = "";
+    search_vi = -1;
+    queue_redraw();
+}
 
 } // namespace godot
