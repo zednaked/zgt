@@ -1,0 +1,981 @@
+#include "zgterminal.h"
+
+#include <godot_cpp/classes/display_server.hpp>
+#include <godot_cpp/classes/font_file.hpp>
+#include <godot_cpp/classes/input_event.hpp>
+#include <godot_cpp/classes/input_event_key.hpp>
+#include <godot_cpp/classes/input_event_mouse_button.hpp>
+#include <godot_cpp/classes/input_event_mouse_motion.hpp>
+#include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
+#ifdef LINUX_ENABLED
+#include <fcntl.h>
+#include <pty.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
+
+namespace godot {
+
+// ---- parser states ----
+enum {
+    ST_NORMAL = 0,
+    ST_ESC,
+    ST_CSI,
+    ST_OSC,
+    ST_OSC_ESC,
+    ST_CHARSET,
+};
+
+static bool s_app_cursor_keys = false; // DECCKM, per-process is fine (single terminal)
+
+static const char *kFontCandidates[] = {
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    nullptr,
+};
+
+ZGTerminal::ZGTerminal()
+    : master_fd(-1),
+      child_pid(0),
+      cols(80),
+      rows(24),
+      using_alt(false),
+      scrollback_max(5000),
+      scroll_offset(0),
+      selecting(false), has_sel(false),
+      sel_a_line(0), sel_a_col(0), sel_b_line(0), sel_b_col(0),
+      cur_x(0), cur_y(0),
+      saved_x(0), saved_y(0),
+      cursor_visible(true),
+      cur_fg(-1), cur_bg(-1), cur_flags(0),
+      bracketed_paste(false),
+      scroll_top(0), scroll_bottom(23),
+      parse_state(ST_NORMAL),
+      csi_cur(0), csi_has_digit(false), csi_private(false),
+      utf8_remaining(0), utf8_acc(0),
+      font_size(14), cell_w(8.0f), cell_h(16.0f), ascent(12.0f) {
+    set_focus_mode(FOCUS_ALL);
+    set_clip_contents(true);
+    set_default_cursor_shape(CURSOR_IBEAM);
+    s_app_cursor_keys = false;
+}
+
+ZGTerminal::~ZGTerminal() {
+    _stop_shell();
+}
+
+void ZGTerminal::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("start_terminal"), &ZGTerminal::start_terminal);
+    ClassDB::bind_method(D_METHOD("stop_terminal"), &ZGTerminal::stop_terminal);
+}
+
+// ---------- grid helpers ----------
+
+TermCell ZGTerminal::blank_cell() const {
+    TermCell c;
+    c.ch = ' ';
+    c.fg = cur_fg;
+    c.bg = cur_bg;
+    c.flags = 0;
+    return c;
+}
+
+std::vector<TermCell> &ZGTerminal::active() {
+    return using_alt ? alt : primary;
+}
+
+TermCell &ZGTerminal::cell(int x, int y) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= cols) x = cols - 1;
+    if (y >= rows) y = rows - 1;
+    return active()[y * cols + x];
+}
+
+// ---------- font / grid sizing ----------
+
+void ZGTerminal::_load_font() {
+    for (int i = 0; kFontCandidates[i]; i++) {
+        Ref<FontFile> f;
+        f.instantiate();
+        if (f->load_dynamic_font(kFontCandidates[i]) == OK) {
+            font = f;
+            break;
+        }
+    }
+    if (font.is_null()) {
+        font = get_theme_default_font();
+    }
+    if (font.is_valid()) {
+        cell_w = font->get_string_size("M", (HorizontalAlignment)0, -1, font_size).x;
+        cell_h = font->get_height(font_size);
+        ascent = font->get_ascent(font_size);
+        if (cell_w < 1.0f) cell_w = 8.0f;
+        if (cell_h < 1.0f) cell_h = 16.0f;
+    }
+}
+
+void ZGTerminal::_recompute_grid() {
+    Vector2 sz = get_size();
+    int new_cols = std::max(1, (int)(sz.x / cell_w));
+    int new_rows = std::max(1, (int)(sz.y / cell_h));
+    if (new_cols == cols && new_rows == rows &&
+            (int)primary.size() == cols * rows) {
+        return;
+    }
+
+    std::vector<TermCell> np(new_cols * new_rows, blank_cell());
+    std::vector<TermCell> na(new_cols * new_rows, blank_cell());
+    int copy_cols = std::min(cols, new_cols);
+    int copy_rows = std::min(rows, new_rows);
+    if ((int)primary.size() == cols * rows) {
+        for (int y = 0; y < copy_rows; y++) {
+            for (int x = 0; x < copy_cols; x++) {
+                np[y * new_cols + x] = primary[y * cols + x];
+                na[y * new_cols + x] = alt[y * cols + x];
+            }
+        }
+    }
+    primary.swap(np);
+    alt.swap(na);
+
+    cols = new_cols;
+    rows = new_rows;
+    scroll_top = 0;
+    scroll_bottom = rows - 1;
+    cur_x = std::min(cur_x, cols - 1);
+    cur_y = std::min(cur_y, rows - 1);
+
+    _set_winsize();
+}
+
+void ZGTerminal::_set_winsize() {
+#ifdef LINUX_ENABLED
+    if (master_fd < 0) return;
+    struct winsize ws;
+    ws.ws_row = (unsigned short)rows;
+    ws.ws_col = (unsigned short)cols;
+    ws.ws_xpixel = 0;
+    ws.ws_ypixel = 0;
+    ioctl(master_fd, TIOCSWINSZ, &ws);
+#endif
+}
+
+// ---------- shell lifecycle ----------
+
+void ZGTerminal::_start_shell() {
+#ifdef LINUX_ENABLED
+    if (master_fd >= 0) return;
+
+    _load_font();
+    _recompute_grid();
+
+    struct winsize ws;
+    ws.ws_row = (unsigned short)rows;
+    ws.ws_col = (unsigned short)cols;
+    ws.ws_xpixel = 0;
+    ws.ws_ypixel = 0;
+
+    int fd = -1;
+    int pid = forkpty(&fd, nullptr, nullptr, &ws);
+    if (pid < 0) {
+        UtilityFunctions::print("ZGTerminal: forkpty failed");
+        return;
+    }
+    if (pid == 0) {
+        setenv("TERM", "xterm-256color", 1);
+        setenv("COLORTERM", "truecolor", 1);
+        const char *shell = getenv("SHELL");
+        if (!shell || !*shell) shell = "/bin/bash";
+        execlp(shell, shell, "-i", (char *)nullptr);
+        _exit(127);
+    }
+
+    child_pid = pid;
+    master_fd = fd;
+    fcntl(master_fd, F_SETFL, O_NONBLOCK);
+    signal(SIGCHLD, _sigchld_handler);
+
+    set_process(true);
+    queue_redraw();
+#endif
+}
+
+void ZGTerminal::_stop_shell() {
+#ifdef LINUX_ENABLED
+    set_process(false);
+    if (child_pid > 0) {
+        kill(child_pid, SIGTERM);
+        child_pid = 0;
+    }
+    if (master_fd >= 0) {
+        close(master_fd);
+        master_fd = -1;
+    }
+    signal(SIGCHLD, SIG_DFL);
+#endif
+}
+
+void ZGTerminal::_read_pty() {
+#ifdef LINUX_ENABLED
+    if (master_fd < 0) return;
+    uint8_t buf[8192];
+    bool changed = false;
+    for (;;) {
+        ssize_t n = read(master_fd, buf, sizeof(buf));
+        if (n > 0) {
+            _feed(buf, (int)n);
+            changed = true;
+            continue;
+        }
+        if (n == 0) {
+            _stop_shell();
+            break;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        if (errno == EINTR) continue;
+        _stop_shell();
+        break;
+    }
+    if (changed) {
+        if (scroll_offset > (int)scrollback.size()) scroll_offset = scrollback.size();
+        queue_redraw();
+    }
+#endif
+}
+
+// ---------- escape-sequence parser ----------
+
+void ZGTerminal::_feed(const uint8_t *data, int len) {
+    for (int i = 0; i < len; i++) {
+        uint8_t b = data[i];
+
+        switch (parse_state) {
+            case ST_NORMAL: {
+                if (utf8_remaining > 0) {
+                    if ((b & 0xC0) == 0x80) {
+                        utf8_acc = (utf8_acc << 6) | (b & 0x3F);
+                        if (--utf8_remaining == 0) _put_char(utf8_acc);
+                    } else {
+                        utf8_remaining = 0;
+                        i--;
+                    }
+                    break;
+                }
+                if (b == 0x1B) {
+                    parse_state = ST_ESC;
+                } else if (b == '\n') {
+                    _line_feed();
+                } else if (b == '\r') {
+                    _carriage_return();
+                } else if (b == '\b') {
+                    _backspace();
+                } else if (b == '\t') {
+                    _tab();
+                } else if (b == 0x07) {
+                    // bell
+                } else if (b < 0x20) {
+                    // other control, ignore
+                } else if (b < 0x80) {
+                    _put_char(b);
+                } else if ((b & 0xE0) == 0xC0) {
+                    utf8_acc = b & 0x1F; utf8_remaining = 1;
+                } else if ((b & 0xF0) == 0xE0) {
+                    utf8_acc = b & 0x0F; utf8_remaining = 2;
+                } else if ((b & 0xF8) == 0xF0) {
+                    utf8_acc = b & 0x07; utf8_remaining = 3;
+                }
+            } break;
+
+            case ST_ESC: {
+                if (b == '[') {
+                    csi_params.clear();
+                    csi_cur = 0;
+                    csi_has_digit = false;
+                    csi_private = false;
+                    parse_state = ST_CSI;
+                } else if (b == ']') {
+                    parse_state = ST_OSC;
+                } else if (b == '7') {
+                    saved_x = cur_x; saved_y = cur_y; parse_state = ST_NORMAL;
+                } else if (b == '8') {
+                    cur_x = saved_x; cur_y = saved_y; parse_state = ST_NORMAL;
+                } else if (b == 'M') {
+                    _reverse_index(); parse_state = ST_NORMAL;
+                } else if (b == '(' || b == ')' || b == '*' || b == '+') {
+                    parse_state = ST_CHARSET;
+                } else {
+                    parse_state = ST_NORMAL;
+                }
+            } break;
+
+            case ST_CHARSET: {
+                parse_state = ST_NORMAL;
+            } break;
+
+            case ST_CSI: {
+                if (b >= '0' && b <= '9') {
+                    csi_cur = csi_cur * 10 + (b - '0');
+                    csi_has_digit = true;
+                } else if (b == ';') {
+                    csi_params.push_back(csi_has_digit ? csi_cur : -1);
+                    csi_cur = 0;
+                    csi_has_digit = false;
+                } else if (b == '?' || b == '>' || b == '!') {
+                    csi_private = true;
+                } else if (b >= 0x40 && b <= 0x7E) {
+                    csi_params.push_back(csi_has_digit ? csi_cur : -1);
+                    _handle_csi((char)b);
+                    parse_state = ST_NORMAL;
+                }
+            } break;
+
+            case ST_OSC: {
+                if (b == 0x07) {
+                    parse_state = ST_NORMAL;
+                } else if (b == 0x1B) {
+                    parse_state = ST_OSC_ESC;
+                }
+            } break;
+
+            case ST_OSC_ESC: {
+                parse_state = ST_NORMAL;
+            } break;
+        }
+    }
+}
+
+void ZGTerminal::_put_char(char32_t c) {
+    if (cur_x >= cols) {
+        cur_x = 0;
+        _line_feed();
+    }
+    TermCell &cl = cell(cur_x, cur_y);
+    cl.ch = c;
+    cl.fg = cur_fg;
+    cl.bg = cur_bg;
+    cl.flags = cur_flags;
+    cur_x++;
+}
+
+void ZGTerminal::_line_feed() {
+    if (cur_y == scroll_bottom) {
+        _scroll_up(1);
+    } else if (cur_y < rows - 1) {
+        cur_y++;
+    }
+}
+
+void ZGTerminal::_reverse_index() {
+    if (cur_y == scroll_top) {
+        _scroll_down(1);
+    } else if (cur_y > 0) {
+        cur_y--;
+    }
+}
+
+void ZGTerminal::_carriage_return() { cur_x = 0; }
+
+void ZGTerminal::_backspace() { if (cur_x > 0) cur_x--; }
+
+void ZGTerminal::_tab() {
+    cur_x = ((cur_x / 8) + 1) * 8;
+    if (cur_x >= cols) cur_x = cols - 1;
+}
+
+void ZGTerminal::_push_scrollback_line(int grid_row) {
+    std::vector<TermCell> &g = active();
+    std::vector<TermCell> line(g.begin() + grid_row * cols, g.begin() + grid_row * cols + cols);
+    scrollback.push_back(std::move(line));
+    if (scroll_offset > 0) scroll_offset++;
+    while ((int)scrollback.size() > scrollback_max) {
+        scrollback.pop_front();
+        if (scroll_offset > 0) scroll_offset--;
+    }
+    if (scroll_offset > (int)scrollback.size()) scroll_offset = scrollback.size();
+}
+
+void ZGTerminal::_scroll_up(int n) {
+    if (n <= 0) return;
+    std::vector<TermCell> &g = active();
+    // Lines that scroll off the top of the primary full screen go to scrollback.
+    if (!using_alt && scroll_top == 0) {
+        for (int k = 0; k < n && k < rows; k++) _push_scrollback_line(k);
+    }
+    for (int y = scroll_top; y <= scroll_bottom; y++) {
+        int src = y + n;
+        for (int x = 0; x < cols; x++) {
+            g[y * cols + x] = (src <= scroll_bottom) ? g[src * cols + x] : blank_cell();
+        }
+    }
+}
+
+void ZGTerminal::_scroll_down(int n) {
+    if (n <= 0) return;
+    std::vector<TermCell> &g = active();
+    for (int y = scroll_bottom; y >= scroll_top; y--) {
+        int src = y - n;
+        for (int x = 0; x < cols; x++) {
+            g[y * cols + x] = (src >= scroll_top) ? g[src * cols + x] : blank_cell();
+        }
+    }
+}
+
+void ZGTerminal::_handle_csi(char final) {
+    auto getp = [&](int i, int def) -> int {
+        if (i < (int)csi_params.size() && csi_params[i] > 0) return csi_params[i];
+        return def;
+    };
+    int p0 = getp(0, 1);
+
+    switch (final) {
+        case 'A': cur_y = std::max(0, cur_y - p0); break;
+        case 'B': cur_y = std::min(rows - 1, cur_y + p0); break;
+        case 'C': cur_x = std::min(cols - 1, cur_x + p0); break;
+        case 'D': cur_x = std::max(0, cur_x - p0); break;
+        case 'E': cur_y = std::min(rows - 1, cur_y + p0); cur_x = 0; break;
+        case 'F': cur_y = std::max(0, cur_y - p0); cur_x = 0; break;
+        case 'G': case '`': cur_x = std::min(cols - 1, std::max(0, p0 - 1)); break;
+        case 'd': cur_y = std::min(rows - 1, std::max(0, p0 - 1)); break;
+        case 'H': case 'f': {
+            cur_y = std::min(rows - 1, std::max(0, getp(0, 1) - 1));
+            cur_x = std::min(cols - 1, std::max(0, getp(1, 1) - 1));
+        } break;
+        case 'J': _erase_display(getp(0, 0)); break;
+        case 'K': _erase_line(getp(0, 0)); break;
+        case 'L': _insert_lines(p0); break;
+        case 'M': _delete_lines(p0); break;
+        case 'P': _delete_chars(p0); break;
+        case '@': _insert_chars(p0); break;
+        case 'X': _erase_chars(p0); break;
+        case 'S': _scroll_up(p0); break;
+        case 'T': _scroll_down(p0); break;
+        case 'm': _handle_sgr(); break;
+        case 'r': {
+            scroll_top = std::max(0, getp(0, 1) - 1);
+            scroll_bottom = std::min(rows - 1, getp(1, rows) - 1);
+            if (scroll_top >= scroll_bottom) { scroll_top = 0; scroll_bottom = rows - 1; }
+            cur_x = 0; cur_y = scroll_top;
+        } break;
+        case 'h': _set_mode(true); break;
+        case 'l': _set_mode(false); break;
+        case 's': saved_x = cur_x; saved_y = cur_y; break;
+        case 'u': cur_x = saved_x; cur_y = saved_y; break;
+        case 'n': { // Device Status Report
+            if (!csi_private) {
+                int p = getp(0, 0);
+                if (p == 6) {
+                    _send(String::chr(0x1B) + "[" + String::num_int64(cur_y + 1) +
+                        ";" + String::num_int64(cur_x + 1) + "R");
+                } else if (p == 5) {
+                    _send(String::chr(0x1B) + "[0n");
+                }
+            }
+        } break;
+        case 'c': { // Device Attributes
+            if (csi_private) {
+                _send(String::chr(0x1B) + "[>0;276;0c"); // secondary DA
+            } else {
+                _send(String::chr(0x1B) + "[?6c");       // primary DA (VT102)
+            }
+        } break;
+        default: break;
+    }
+}
+
+void ZGTerminal::_set_mode(bool enable) {
+    if (!csi_private) return;
+    int p = csi_params.empty() ? 0 : csi_params[0];
+    switch (p) {
+        case 1: s_app_cursor_keys = enable; break;     // DECCKM
+        case 25: cursor_visible = enable; break;
+        case 47:
+        case 1047:
+        case 1049: _switch_alt(enable); break;
+        case 2004: bracketed_paste = enable; break;
+        default: break;
+    }
+}
+
+void ZGTerminal::_switch_alt(bool enable) {
+    if (enable == using_alt) return;
+    if (enable) {
+        saved_x = cur_x; saved_y = cur_y;
+        using_alt = true;
+        std::fill(alt.begin(), alt.end(), blank_cell());
+        cur_x = 0; cur_y = 0;
+        scroll_offset = 0;
+    } else {
+        using_alt = false;
+        cur_x = saved_x; cur_y = saved_y;
+        scroll_offset = 0;
+    }
+}
+
+void ZGTerminal::_handle_sgr() {
+    if (csi_params.empty() || (csi_params.size() == 1 && csi_params[0] < 0)) {
+        cur_fg = -1; cur_bg = -1; cur_flags = 0;
+        return;
+    }
+    for (size_t i = 0; i < csi_params.size(); i++) {
+        int p = csi_params[i] < 0 ? 0 : csi_params[i];
+        if (p == 0) { cur_fg = -1; cur_bg = -1; cur_flags = 0; }
+        else if (p == 1) cur_flags |= TF_BOLD;
+        else if (p == 4) cur_flags |= TF_UNDERLINE;
+        else if (p == 7) cur_flags |= TF_INVERSE;
+        else if (p == 22) cur_flags &= ~TF_BOLD;
+        else if (p == 24) cur_flags &= ~TF_UNDERLINE;
+        else if (p == 27) cur_flags &= ~TF_INVERSE;
+        else if (p >= 30 && p <= 37) cur_fg = p - 30;
+        else if (p == 39) cur_fg = -1;
+        else if (p >= 40 && p <= 47) cur_bg = p - 40;
+        else if (p == 49) cur_bg = -1;
+        else if (p >= 90 && p <= 97) cur_fg = (p - 90) + 8;
+        else if (p >= 100 && p <= 107) cur_bg = (p - 100) + 8;
+        else if (p == 38 || p == 48) {
+            bool fg = (p == 38);
+            int mode = (i + 1 < csi_params.size()) ? csi_params[i + 1] : -1;
+            if (mode == 5) {
+                int idx = (i + 2 < csi_params.size()) ? csi_params[i + 2] : 0;
+                if (idx < 0) idx = 0;
+                if (fg) cur_fg = idx; else cur_bg = idx;
+                i += 2;
+            } else if (mode == 2) {
+                int r = (i + 2 < csi_params.size()) ? std::max(0, csi_params[i + 2]) : 0;
+                int g = (i + 3 < csi_params.size()) ? std::max(0, csi_params[i + 3]) : 0;
+                int bl = (i + 4 < csi_params.size()) ? std::max(0, csi_params[i + 4]) : 0;
+                int32_t packed = ZGT_TRUECOLOR | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (bl & 0xFF);
+                if (fg) cur_fg = packed; else cur_bg = packed;
+                i += 4;
+            }
+        }
+    }
+}
+
+void ZGTerminal::_erase_display(int mode) {
+    std::vector<TermCell> &g = active();
+    int start = 0, end = cols * rows;
+    if (mode == 0) start = cur_y * cols + cur_x;
+    else if (mode == 1) end = cur_y * cols + cur_x + 1;
+    for (int i = start; i < end && i < (int)g.size(); i++) g[i] = blank_cell();
+}
+
+void ZGTerminal::_erase_line(int mode) {
+    int x0 = 0, x1 = cols;
+    if (mode == 0) x0 = cur_x;
+    else if (mode == 1) x1 = cur_x + 1;
+    for (int x = x0; x < x1; x++) cell(x, cur_y) = blank_cell();
+}
+
+void ZGTerminal::_insert_lines(int n) {
+    if (cur_y < scroll_top || cur_y > scroll_bottom) return;
+    std::vector<TermCell> &g = active();
+    for (int y = scroll_bottom; y >= cur_y; y--) {
+        int src = y - n;
+        for (int x = 0; x < cols; x++) {
+            g[y * cols + x] = (src >= cur_y) ? g[src * cols + x] : blank_cell();
+        }
+    }
+}
+
+void ZGTerminal::_delete_lines(int n) {
+    if (cur_y < scroll_top || cur_y > scroll_bottom) return;
+    std::vector<TermCell> &g = active();
+    for (int y = cur_y; y <= scroll_bottom; y++) {
+        int src = y + n;
+        for (int x = 0; x < cols; x++) {
+            g[y * cols + x] = (src <= scroll_bottom) ? g[src * cols + x] : blank_cell();
+        }
+    }
+}
+
+void ZGTerminal::_delete_chars(int n) {
+    for (int x = cur_x; x < cols; x++) {
+        int src = x + n;
+        cell(x, cur_y) = (src < cols) ? cell(src, cur_y) : blank_cell();
+    }
+}
+
+void ZGTerminal::_insert_chars(int n) {
+    for (int x = cols - 1; x >= cur_x; x--) {
+        int src = x - n;
+        cell(x, cur_y) = (src >= cur_x) ? cell(src, cur_y) : blank_cell();
+    }
+}
+
+void ZGTerminal::_erase_chars(int n) {
+    for (int x = cur_x; x < cur_x + n && x < cols; x++) cell(x, cur_y) = blank_cell();
+}
+
+// ---------- colors ----------
+
+Color ZGTerminal::_ansi_color(int32_t idx, bool is_fg) const {
+    static const Color base16[16] = {
+        Color(0.0, 0.0, 0.0), Color(0.8, 0.0, 0.0), Color(0.0, 0.8, 0.0), Color(0.8, 0.8, 0.0),
+        Color(0.16, 0.39, 0.86), Color(0.8, 0.0, 0.8), Color(0.0, 0.8, 0.8), Color(0.78, 0.78, 0.78),
+        Color(0.34, 0.34, 0.34), Color(1.0, 0.33, 0.33), Color(0.33, 1.0, 0.33), Color(1.0, 1.0, 0.33),
+        Color(0.4, 0.6, 1.0), Color(1.0, 0.33, 1.0), Color(0.33, 1.0, 1.0), Color(1.0, 1.0, 1.0),
+    };
+    if (idx < 0) {
+        return is_fg ? Color(0.85, 0.85, 0.85) : Color(0.11, 0.11, 0.13);
+    }
+    if (idx & ZGT_TRUECOLOR) {
+        float r = ((idx >> 16) & 0xFF) / 255.0f;
+        float g = ((idx >> 8) & 0xFF) / 255.0f;
+        float b = (idx & 0xFF) / 255.0f;
+        return Color(r, g, b);
+    }
+    if (idx < 16) return base16[idx];
+    if (idx < 232) {
+        int i = idx - 16;
+        int r = i / 36, g = (i / 6) % 6, b = i % 6;
+        auto comp = [](int v) { return v == 0 ? 0.0f : (55.0f + 40.0f * v) / 255.0f; };
+        return Color(comp(r), comp(g), comp(b));
+    }
+    float v = (8.0f + (idx - 232) * 10.0f) / 255.0f;
+    return Color(v, v, v);
+}
+
+// ---------- view / selection ----------
+
+int ZGTerminal::_viewport_top_vi() const {
+    return (int)scrollback.size() - scroll_offset;
+}
+
+void ZGTerminal::_scroll_view(int delta_lines) {
+    int maxoff = (int)scrollback.size();
+    scroll_offset += delta_lines;
+    if (scroll_offset < 0) scroll_offset = 0;
+    if (scroll_offset > maxoff) scroll_offset = maxoff;
+    queue_redraw();
+}
+
+void ZGTerminal::_snap_to_bottom() {
+    if (scroll_offset != 0) {
+        scroll_offset = 0;
+        queue_redraw();
+    }
+}
+
+void ZGTerminal::_get_line_cells(int vi, std::vector<TermCell> &out) const {
+    int n = (int)scrollback.size();
+    if (vi >= 0 && vi < n) {
+        out = scrollback[vi];
+        return;
+    }
+    int r = vi - n;
+    const std::vector<TermCell> &g = using_alt ? alt : primary;
+    out.assign(cols, TermCell());
+    if (r >= 0 && r < rows && (int)g.size() == cols * rows) {
+        for (int x = 0; x < cols; x++) out[x] = g[r * cols + x];
+    }
+}
+
+void ZGTerminal::_begin_selection(const Vector2 &local) {
+    int sx = std::min(cols - 1, std::max(0, (int)(local.x / cell_w)));
+    int sy = std::min(rows - 1, std::max(0, (int)(local.y / cell_h)));
+    int vi = _viewport_top_vi() + sy;
+    sel_a_line = sel_b_line = vi;
+    sel_a_col = sel_b_col = sx;
+    selecting = true;
+    has_sel = false;
+    queue_redraw();
+}
+
+void ZGTerminal::_update_selection(const Vector2 &local) {
+    int sx = std::min(cols - 1, std::max(0, (int)(local.x / cell_w)));
+    int sy = std::min(rows - 1, std::max(0, (int)(local.y / cell_h)));
+    sel_b_line = _viewport_top_vi() + sy;
+    sel_b_col = sx;
+    has_sel = (sel_b_line != sel_a_line || sel_b_col != sel_a_col);
+    queue_redraw();
+}
+
+bool ZGTerminal::_in_selection(int vi, int col) const {
+    if (!has_sel) return false;
+    int s_line = sel_a_line, s_col = sel_a_col, e_line = sel_b_line, e_col = sel_b_col;
+    if (e_line < s_line || (e_line == s_line && e_col < s_col)) {
+        std::swap(s_line, e_line);
+        std::swap(s_col, e_col);
+    }
+    if (vi < s_line || vi > e_line) return false;
+    if (vi == s_line && col < s_col) return false;
+    if (vi == e_line && col > e_col) return false;
+    return true;
+}
+
+void ZGTerminal::_copy_selection() {
+    if (!has_sel) return;
+    int s_line = sel_a_line, s_col = sel_a_col, e_line = sel_b_line, e_col = sel_b_col;
+    if (e_line < s_line || (e_line == s_line && e_col < s_col)) {
+        std::swap(s_line, e_line);
+        std::swap(s_col, e_col);
+    }
+    String text;
+    std::vector<TermCell> line;
+    for (int vi = s_line; vi <= e_line; vi++) {
+        _get_line_cells(vi, line);
+        int c0 = (vi == s_line) ? s_col : 0;
+        int c1 = (vi == e_line) ? e_col : (int)line.size() - 1;
+        String row;
+        for (int c = c0; c <= c1 && c < (int)line.size(); c++) {
+            char32_t ch = line[c].ch;
+            row += String::chr(ch == 0 ? ' ' : ch);
+        }
+        row = row.rstrip(" \t");
+        text += row;
+        if (vi < e_line) text += "\n";
+    }
+    if (!text.is_empty()) {
+        DisplayServer::get_singleton()->clipboard_set(text);
+    }
+}
+
+void ZGTerminal::_paste_clipboard() {
+    String t = DisplayServer::get_singleton()->clipboard_get();
+    if (t.is_empty()) return;
+    _snap_to_bottom();
+    if (bracketed_paste) {
+        _send(String::chr(0x1B) + "[200~");
+        _send(t);
+        _send(String::chr(0x1B) + "[201~");
+    } else {
+        _send(t);
+    }
+}
+
+// ---------- drawing ----------
+
+void ZGTerminal::_notification(int p_what) {
+    switch (p_what) {
+        case NOTIFICATION_READY:
+            _start_shell();
+            break;
+        case NOTIFICATION_PROCESS:
+            _read_pty();
+            break;
+        case NOTIFICATION_RESIZED:
+            _recompute_grid();
+            queue_redraw();
+            break;
+        case NOTIFICATION_FOCUS_ENTER:
+        case NOTIFICATION_FOCUS_EXIT:
+            queue_redraw();
+            break;
+        case NOTIFICATION_DRAW: {
+            draw_rect(Rect2(Vector2(0, 0), get_size()), _ansi_color(-1, false), true);
+            if (primary.empty() || font.is_null()) break;
+
+            int top_vi = _viewport_top_vi();
+            int n_back = (int)scrollback.size();
+            Color sel_color(0.20, 0.40, 0.85, 0.55);
+
+            std::vector<TermCell> rowbuf;
+            for (int y = 0; y < rows; y++) {
+                int vi = top_vi + y;
+                const TermCell *line = nullptr;
+                int line_len = 0;
+                if (vi >= 0 && vi < n_back) {
+                    line = scrollback[vi].data();
+                    line_len = (int)scrollback[vi].size();
+                } else {
+                    int r = vi - n_back;
+                    if (r >= 0 && r < rows) {
+                        line = active().data() + r * cols;
+                        line_len = cols;
+                    }
+                }
+
+                float py = y * cell_h;
+                for (int x = 0; x < cols; x++) {
+                    float px = x * cell_w;
+                    TermCell cl;
+                    if (line && x < line_len) cl = line[x];
+
+                    int32_t fg = cl.fg, bg = cl.bg;
+                    if (cl.flags & TF_INVERSE) std::swap(fg, bg);
+                    if ((cl.flags & TF_BOLD) && fg >= 0 && fg < 8) fg += 8;
+
+                    if (bg >= 0 || (cl.flags & TF_INVERSE)) {
+                        draw_rect(Rect2(px, py, cell_w + 1, cell_h), _ansi_color(bg, false), true);
+                    }
+                    if (_in_selection(vi, x)) {
+                        draw_rect(Rect2(px, py, cell_w + 1, cell_h), sel_color, true);
+                    }
+                    if (cl.ch != ' ' && cl.ch != 0) {
+                        draw_char(font, Vector2(px, py + ascent), String::chr(cl.ch),
+                            font_size, _ansi_color(fg, true));
+                    }
+                    if (cl.flags & TF_UNDERLINE) {
+                        draw_rect(Rect2(px, py + cell_h - 1, cell_w, 1), _ansi_color(fg, true), true);
+                    }
+                }
+            }
+
+            // cursor (only when viewing the live bottom)
+            if (cursor_visible && scroll_offset == 0) {
+                float px = cur_x * cell_w;
+                float py = cur_y * cell_h;
+                Color cc = _ansi_color(-1, true);
+                if (has_focus()) {
+                    draw_rect(Rect2(px, py, cell_w, cell_h), cc, true);
+                    const TermCell &cl = cell(cur_x, cur_y);
+                    if (cl.ch != ' ' && cl.ch != 0) {
+                        draw_char(font, Vector2(px, py + ascent), String::chr(cl.ch),
+                            font_size, _ansi_color(-1, false));
+                    }
+                } else {
+                    draw_rect(Rect2(px, py, cell_w, cell_h), cc, false, 1.0);
+                }
+            }
+        } break;
+        case NOTIFICATION_EXIT_TREE:
+        case NOTIFICATION_PREDELETE:
+            _stop_shell();
+            break;
+    }
+}
+
+// ---------- input ----------
+
+void ZGTerminal::_send(const String &s) {
+#ifdef LINUX_ENABLED
+    if (master_fd < 0 || s.is_empty()) return;
+    CharString cs = s.utf8();
+    ssize_t to_write = cs.length();
+    const char *p = cs.get_data();
+    while (to_write > 0) {
+        ssize_t n = write(master_fd, p, to_write);
+        if (n <= 0) break;
+        p += n;
+        to_write -= n;
+    }
+#endif
+}
+
+void ZGTerminal::_gui_input(const Ref<InputEvent> &p_event) {
+    // mouse buttons
+    Ref<InputEventMouseButton> mb = p_event;
+    if (mb.is_valid()) {
+        MouseButton b = mb->get_button_index();
+        if (mb->is_pressed()) {
+            if (b == MOUSE_BUTTON_WHEEL_UP) {
+                if (using_alt) { for (int i = 0; i < 3; i++) _send(String::chr(0x1B) + "OA"); }
+                else _scroll_view(3);
+                accept_event();
+                return;
+            }
+            if (b == MOUSE_BUTTON_WHEEL_DOWN) {
+                if (using_alt) { for (int i = 0; i < 3; i++) _send(String::chr(0x1B) + "OB"); }
+                else _scroll_view(-3);
+                accept_event();
+                return;
+            }
+            if (b == MOUSE_BUTTON_LEFT) {
+                grab_focus();
+                _begin_selection(mb->get_position());
+                accept_event();
+                return;
+            }
+            if (b == MOUSE_BUTTON_MIDDLE) {
+                _paste_clipboard();
+                accept_event();
+                return;
+            }
+        } else {
+            if (b == MOUSE_BUTTON_LEFT) {
+                selecting = false;
+                if (has_sel) _copy_selection();
+                accept_event();
+                return;
+            }
+        }
+        return;
+    }
+
+    // mouse motion (drag-select)
+    Ref<InputEventMouseMotion> mm = p_event;
+    if (mm.is_valid()) {
+        if (selecting) {
+            _update_selection(mm->get_position());
+            accept_event();
+        }
+        return;
+    }
+
+    // keyboard
+    Ref<InputEventKey> k = p_event;
+    if (k.is_null() || !k->is_pressed()) return;
+
+    Key kc = k->get_keycode();
+    bool ctrl = k->is_ctrl_pressed();
+    bool alt = k->is_alt_pressed();
+    bool shift = k->is_shift_pressed();
+
+    // copy / paste shortcuts
+    if (ctrl && shift && kc == KEY_C) { _copy_selection(); accept_event(); return; }
+    if (ctrl && shift && kc == KEY_V) { _paste_clipboard(); accept_event(); return; }
+
+    String seq;
+    String ck = s_app_cursor_keys ? "O" : "[";
+
+    switch (kc) {
+        case KEY_ENTER:
+        case KEY_KP_ENTER: seq = String::chr('\r'); break;
+        case KEY_BACKSPACE: seq = String::chr(0x7F); break;
+        case KEY_TAB: seq = String::chr('\t'); break;
+        case KEY_ESCAPE: seq = String::chr(0x1B); break;
+        case KEY_UP: seq = String::chr(0x1B) + ck + "A"; break;
+        case KEY_DOWN: seq = String::chr(0x1B) + ck + "B"; break;
+        case KEY_RIGHT: seq = String::chr(0x1B) + ck + "C"; break;
+        case KEY_LEFT: seq = String::chr(0x1B) + ck + "D"; break;
+        case KEY_HOME: seq = String::chr(0x1B) + "[H"; break;
+        case KEY_END: seq = String::chr(0x1B) + "[F"; break;
+        case KEY_PAGEUP: seq = String::chr(0x1B) + "[5~"; break;
+        case KEY_PAGEDOWN: seq = String::chr(0x1B) + "[6~"; break;
+        case KEY_INSERT: seq = String::chr(0x1B) + "[2~"; break;
+        case KEY_DELETE: seq = String::chr(0x1B) + "[3~"; break;
+        default: {
+            char32_t u = k->get_unicode();
+            if (ctrl && kc >= KEY_A && kc <= KEY_Z) {
+                seq = String::chr((char32_t)(kc - KEY_A + 1));
+            } else if (ctrl && kc == KEY_SPACE) {
+                seq = String::chr((char32_t)0);
+            } else if (u != 0) {
+                if (alt) seq = String::chr(0x1B);
+                seq += String::chr(u);
+            }
+        } break;
+    }
+
+    if (!seq.is_empty()) {
+        _snap_to_bottom();
+        _send(seq);
+        accept_event();
+    }
+}
+
+void ZGTerminal::_sigchld_handler(int signum) {
+    while (waitpid(-1, nullptr, WNOHANG) > 0) {
+    }
+}
+
+// ---------- public (plugin API) ----------
+
+void ZGTerminal::start_terminal() { _start_shell(); }
+
+void ZGTerminal::stop_terminal() { _stop_shell(); }
+
+} // namespace godot
