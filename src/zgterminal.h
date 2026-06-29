@@ -28,6 +28,8 @@ enum TermFlags {
     TF_BOLD = 1,
     TF_UNDERLINE = 2,
     TF_INVERSE = 4,
+    TF_WIDE = 8,       // lead cell of a double-width glyph (CJK/emoji)
+    TF_WIDE_CONT = 16, // placeholder cell to the right of a TF_WIDE lead
 };
 
 // A self-contained terminal emulator Control: it runs a real shell on a PTY,

@@ -1,4 +1,5 @@
 #include "zgterminal.h"
+#include "wcwidth.h"
 
 #include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/font_file.hpp>
@@ -11,11 +12,13 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 #ifdef LINUX_ENABLED
 #include <fcntl.h>
@@ -54,6 +57,25 @@ static const char *kFontCandidates[] = {
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
     "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    nullptr,
+};
+
+// Fallback fonts consulted (in order) when the primary font lacks a glyph —
+// chiefly CJK ideographs and emoji, so wide characters render instead of tofu.
+// Cheap existence check so we don't ask Godot to load missing font paths
+// (load_dynamic_font logs a visible ERROR for every path that isn't there).
+static bool zgt_path_exists(const char *p) {
+    std::ifstream f(p);
+    return f.good();
+}
+
+static const char *kFallbackFonts[] = {
+    "/usr/local/share/fonts/NotoSansCJK/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/TTF/NotoColorEmoji.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     nullptr,
 };
 
@@ -128,6 +150,7 @@ TermCell &ZGTerminal::cell(int x, int y) {
 
 void ZGTerminal::_load_font() {
     font.unref();
+    bool own_font = false; // true once we loaded our own FontFile (not the shared theme font)
 
     // A user-configured font path (ProjectSettings "zgt/terminal/font_path")
     // takes priority over the built-in candidates.
@@ -136,23 +159,42 @@ void ZGTerminal::_load_font() {
         String p = ps->get_setting("zgt/terminal/font_path");
         if (!p.is_empty()) {
             if (p.begins_with("res://") || p.begins_with("user://")) p = ps->globalize_path(p);
-            Ref<FontFile> f;
-            f.instantiate();
-            if (f->load_dynamic_font(p) == OK) font = f;
+            if (zgt_path_exists(p.utf8().get_data())) {
+                Ref<FontFile> f;
+                f.instantiate();
+                if (f->load_dynamic_font(p) == OK) { font = f; own_font = true; }
+            }
         }
     }
 
     for (int i = 0; font.is_null() && kFontCandidates[i]; i++) {
+        if (!zgt_path_exists(kFontCandidates[i])) continue;
         Ref<FontFile> f;
         f.instantiate();
         if (f->load_dynamic_font(kFontCandidates[i]) == OK) {
             font = f;
+            own_font = true;
             break;
         }
     }
     if (font.is_null()) {
         font = get_theme_default_font();
     }
+
+    // Attach CJK / emoji fallbacks so wide glyphs (TF_WIDE) actually render
+    // instead of showing tofu. Only on a font we own — never mutate the shared
+    // editor theme font.
+    if (own_font && font.is_valid()) {
+        TypedArray<Font> fallbacks;
+        for (int i = 0; kFallbackFonts[i]; i++) {
+            if (!zgt_path_exists(kFallbackFonts[i])) continue;
+            Ref<FontFile> f;
+            f.instantiate();
+            if (f->load_dynamic_font(kFallbackFonts[i]) == OK) fallbacks.push_back(f);
+        }
+        if (!fallbacks.is_empty()) font->set_fallbacks(fallbacks);
+    }
+
     if (font.is_valid()) {
         cell_w = font->get_string_size("M", (HorizontalAlignment)0, -1, font_size).x;
         cell_h = font->get_height(font_size);
@@ -467,16 +509,44 @@ void ZGTerminal::_feed(const uint8_t *data, int len) {
 }
 
 void ZGTerminal::_put_char(char32_t c) {
-    if (cur_x >= cols) {
+    int w = zgt_char_width(c);
+    if (w == 0) return; // zero-width / combining mark: ignored for now
+
+    if (cur_x + w > cols) {
         cur_x = 0;
         _line_feed();
     }
+
+    // If we're about to overwrite one half of an existing wide pair, neutralise
+    // its partner so no orphan lead/continuation cell is left behind.
+    {
+        TermCell &t = cell(cur_x, cur_y);
+        if ((t.flags & TF_WIDE) && cur_x + 1 < cols) {
+            TermCell &r = cell(cur_x + 1, cur_y);
+            r.ch = ' '; r.flags &= ~TF_WIDE_CONT;
+        } else if ((t.flags & TF_WIDE_CONT) && cur_x > 0) {
+            TermCell &l = cell(cur_x - 1, cur_y);
+            l.ch = ' '; l.flags &= ~TF_WIDE;
+        }
+    }
+
     TermCell &cl = cell(cur_x, cur_y);
     cl.ch = c;
     cl.fg = cur_fg;
     cl.bg = cur_bg;
     cl.flags = cur_flags;
-    cur_x++;
+
+    if (w == 2 && cur_x + 1 < cols) {
+        cl.flags |= TF_WIDE;
+        TermCell &cont = cell(cur_x + 1, cur_y);
+        cont.ch = 0;
+        cont.fg = cur_fg;
+        cont.bg = cur_bg;
+        cont.flags = cur_flags | TF_WIDE_CONT;
+        cur_x += 2;
+    } else {
+        cur_x += 1;
+    }
 }
 
 void ZGTerminal::_line_feed() {
@@ -959,6 +1029,7 @@ void ZGTerminal::_copy_selection() {
         int c1 = (vi == e_line) ? e_col : (int)line.size() - 1;
         String row;
         for (int c = c0; c <= c1 && c < (int)line.size(); c++) {
+            if (line[c].flags & TF_WIDE_CONT) continue; // already emitted by the lead cell
             char32_t ch = line[c].ch;
             row += String::chr(ch == 0 ? ' ' : ch);
         }
@@ -1032,18 +1103,25 @@ void ZGTerminal::_notification(int p_what) {
                     }
                 }
 
-                // Search highlight mask for this row.
+                // Search highlight mask for this row. Wide-char continuation
+                // cells are skipped so the text matches what search() scans; a
+                // column map carries each match position back to a real column.
                 hl.clear();
                 if (qlen > 0 && line && line_len > 0) {
                     String text;
-                    for (int x = 0; x < line_len; x++)
+                    std::vector<int> colmap;
+                    for (int x = 0; x < line_len; x++) {
+                        if (line[x].flags & TF_WIDE_CONT) continue;
+                        colmap.push_back(x);
                         text += String::chr(line[x].ch == 0 ? ' ' : line[x].ch);
+                    }
                     String lt = text.to_lower();
                     int pos = lt.find(search_query);
                     if (pos != -1) {
                         hl.assign(line_len, false);
                         while (pos != -1) {
-                            for (int k = 0; k < qlen && pos + k < line_len; k++) hl[pos + k] = true;
+                            for (int k = 0; k < qlen && pos + k < (int)colmap.size(); k++)
+                                hl[colmap[pos + k]] = true;
                             pos = lt.find(search_query, pos + qlen);
                         }
                     }
@@ -1052,31 +1130,37 @@ void ZGTerminal::_notification(int p_what) {
 
                 float py = y * cell_h;
                 for (int x = 0; x < cols; x++) {
-                    float px = x * cell_w;
                     TermCell cl;
                     if (line && x < line_len) cl = line[x];
+
+                    // The right half of a wide glyph is painted by its lead cell.
+                    if (cl.flags & TF_WIDE_CONT) continue;
+
+                    float px = x * cell_w;
+                    // Wide glyphs cover two columns; +1 hides the seam.
+                    float cw = (cl.flags & TF_WIDE) ? cell_w * 2.0f : cell_w;
 
                     int32_t fg = cl.fg, bg = cl.bg;
                     if (cl.flags & TF_INVERSE) std::swap(fg, bg);
                     if ((cl.flags & TF_BOLD) && fg >= 0 && fg < 8) fg += 8;
 
                     if (bg >= 0 || (cl.flags & TF_INVERSE)) {
-                        draw_rect(Rect2(px, py, cell_w + 1, cell_h), _ansi_color(bg, false), true);
+                        draw_rect(Rect2(px, py, cw + 1, cell_h), _ansi_color(bg, false), true);
                     }
                     if (!hl.empty() && x < (int)hl.size() && hl[x]) {
                         Color hc = current_match ? Color(1.0, 0.55, 0.0, 0.65)
                                                  : Color(0.95, 0.85, 0.1, 0.45);
-                        draw_rect(Rect2(px, py, cell_w + 1, cell_h), hc, true);
+                        draw_rect(Rect2(px, py, cw + 1, cell_h), hc, true);
                     }
                     if (_in_selection(vi, x)) {
-                        draw_rect(Rect2(px, py, cell_w + 1, cell_h), sel_color, true);
+                        draw_rect(Rect2(px, py, cw + 1, cell_h), sel_color, true);
                     }
                     if (cl.ch != ' ' && cl.ch != 0) {
                         draw_char(font, Vector2(px, py + ascent), String::chr(cl.ch),
                             font_size, _ansi_color(fg, true));
                     }
                     if (cl.flags & TF_UNDERLINE) {
-                        draw_rect(Rect2(px, py + cell_h - 1, cell_w, 1), _ansi_color(fg, true), true);
+                        draw_rect(Rect2(px, py + cell_h - 1, cw, 1), _ansi_color(fg, true), true);
                     }
                 }
             }
@@ -1085,24 +1169,25 @@ void ZGTerminal::_notification(int p_what) {
             if (cursor_visible && scroll_offset == 0) {
                 float px = cur_x * cell_w;
                 float py = cur_y * cell_h;
+                const TermCell &cl = cell(cur_x, cur_y);
+                float ccw = (cl.flags & TF_WIDE) ? cell_w * 2.0f : cell_w;
                 Color cc = _ansi_color(-1, true);
                 if (has_focus()) {
                     if (cursor_style <= 2) {            // block
-                        draw_rect(Rect2(px, py, cell_w, cell_h), cc, true);
-                        const TermCell &cl = cell(cur_x, cur_y);
+                        draw_rect(Rect2(px, py, ccw, cell_h), cc, true);
                         if (cl.ch != ' ' && cl.ch != 0) {
                             draw_char(font, Vector2(px, py + ascent), String::chr(cl.ch),
                                 font_size, _ansi_color(-1, false));
                         }
                     } else if (cursor_style <= 4) {     // underline
                         float h = std::max(2.0f, cell_h * 0.12f);
-                        draw_rect(Rect2(px, py + cell_h - h, cell_w, h), cc, true);
+                        draw_rect(Rect2(px, py + cell_h - h, ccw, h), cc, true);
                     } else {                            // bar
                         float w = std::max(2.0f, cell_w * 0.15f);
                         draw_rect(Rect2(px, py, w, cell_h), cc, true);
                     }
                 } else {
-                    draw_rect(Rect2(px, py, cell_w, cell_h), cc, false, 1.0);
+                    draw_rect(Rect2(px, py, ccw, cell_h), cc, false, 1.0);
                 }
             }
         } break;
@@ -1376,8 +1461,10 @@ void ZGTerminal::search(const String &query, bool forward) {
         while (vi >= total) vi -= total;
         _get_line_cells(vi, line);
         String text;
-        for (size_t i = 0; i < line.size(); i++)
+        for (size_t i = 0; i < line.size(); i++) {
+            if (line[i].flags & TF_WIDE_CONT) continue;
             text += String::chr(line[i].ch == 0 ? ' ' : line[i].ch);
+        }
         if (text.to_lower().find(search_query) != -1) {
             search_vi = vi;
             // Bring the match roughly to the middle of the viewport.
