@@ -1,79 +1,23 @@
-# CLAUDE.md
+# Architecture
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+How ZGT is put together, and the decisions that are load-bearing. Written for
+anyone who wants to change it without breaking the editor around it.
 
-## Overview
+## Why a PTY and not window embedding
 
-**ZeDs Godot Terminal (ZGT)** — a Godot 4 GDExtension (C++) providing a built-in terminal emulator in the editor's bottom panel. The native `ZGTerminal` Control runs a real shell on a PTY and renders the character grid itself, so it works identically under X11 and Wayland. Linux only.
+ZGT started as a Kitty-window-embedding hack: reparent an X11 `kitty` window
+into the editor's bottom panel. That is unreliable on Wayland compositors,
+because XWayland clients cannot position their own windows — the compositor
+decides, and the terminal ends up floating somewhere the editor does not
+control.
 
-> History: this started as a Kitty-window-embedding hack (reparenting an X11 `kitty` window into the editor). That is unreliable on Wayland compositors (e.g. Hyprland) because XWayland clients can't position their own windows, so it was replaced by a self-contained PTY terminal. The whole project was then renamed to "ZGT" (display name "ZeDs Godot Terminal").
-
-## Repositories
-
-| Repo | URL | Visibility |
-|---|---|---|
-| **zgt** (source) | `https://github.com/zednaked/zgt` | Private |
-| **zgt-bin** (binaries) | `https://github.com/zednaked/zgt-bin` | Public |
-
-## Local directories
-
-| Path | Role |
-|---|---|
-| `/home/zed/dev/zeds-godot-terminal` | **Source repo root** — C++ source, addon, build system, this doc |
-| `/home/zed/dev/zeds-godot-terminal/demo/` | Godot test project inside the repo |
-| `/home/zed/dev/godotterminal` | Development copy with `godot-cpp/` pre-cloned and built (use for builds) |
-| `/home/zed/kitty-terminal-test` | **Active manual test project** — synced with the source git and the `zgt-bin` release binaries |
-
-## Build
-
-```bash
-./setup.sh                          # Clones godot-cpp and checks out the 4.3 branch (one-time)
-scons platform=linux                # Build -> bin/libzgt.linux.template_debug.x86_64.so
-scons platform=linux target=template_release   # Release build
-```
-
-Manual build (godot-cpp must already be compiled):
-
-```bash
-g++ -std=c++17 -fPIC -shared -O2 -DLINUX_ENABLED \
-  -Isrc -Igodot-cpp/include -Igodot-cpp/gen/include -Igodot-cpp/gdextension \
-  src/*.cpp godot-cpp/bin/libgodot-cpp.linux.template_debug.x86_64.a -lutil \
-  -o bin/libzgt.linux.template_debug.x86_64.so
-```
-
-Build output goes to `bin/`. `bin/`, `godot-cpp/`, and `.godot/` are gitignored. `godot-cpp` is pinned to branch `4.3` even though `compatibility_minimum` is `4.2`.
-
-## Verify
-
-```bash
-cp bin/*.so demo/bin/
-godot --editor demo/project.godot   # or open demo/project.godot in the editor
-```
-
-Enable **"ZeDs Godot Terminal"** plugin (Project Settings → Plugins), click the **"ZGT"** bottom-panel tab and type into the shell. Test a non-default shell with `SHELL=/usr/bin/fish godot --editor ...`.
-
-## Deploy
-
-After building, copy artifacts into the demo and optionally push to the binary repo:
-
-```bash
-cp bin/*.so demo/bin/
-# Commit & push source changes to zgt (private)
-# New release on zgt-bin (public) with the .so files
-```
-
-## Naming map (everything is "zgt")
-
-| Thing | Value |
-|---|---|
-| Native class | `ZGTerminal` (`src/zgterminal.cpp/.h`) |
-| Public methods | `start_terminal()`, `stop_terminal()` |
-| Library | `libzgt` |
-| Extension file | `zgt.gdextension`, entry symbol `zgt_library_init` |
-| Addon dir | `addons/zgt/` (plugin "ZeDs Godot Terminal") |
-| Panel tab | "ZGT" |
+So the embedding was dropped and replaced by a self-contained terminal: run the
+shell on a pseudoterminal and render the character grid directly. Nothing in
+the native layer touches X11 or Wayland APIs, which is why it behaves
+identically under both.
 
 ## Architecture
+
 
 Two cooperating layers:
 

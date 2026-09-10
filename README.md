@@ -6,7 +6,13 @@ A Godot 4 GDExtension (C++) that adds a real, built-in terminal to the editor's 
 
 ![ZGT in the Godot editor](screenshot.png)
 
-> This is the **source** repo. Prebuilt binaries and install instructions live in **[zgt-bin](https://github.com/zednaked/zgt-bin)** (public).
+> Prebuilt binaries and install instructions live in **[zgt-bin](https://github.com/zednaked/zgt-bin)** — start there if you just want to use it.
+
+It began as a Kitty-window-embedding hack, reparenting an X11 terminal into the
+editor. That falls apart on Wayland: XWayland clients can't position their own
+windows. So the embedding was thrown out for a self-contained PTY terminal that
+renders its own grid — which is why it behaves the same under X11 and Wayland,
+and why nothing here touches either API.
 
 | Tabs | Scrollback search | Configuration |
 |---|---|---|
@@ -30,10 +36,19 @@ scons platform=linux                            # -> bin/libzgt.linux.template_d
 scons platform=linux target=template_release    # release build
 ```
 
-Then drop the `.so` into a project's `bin/` next to `zgt.gdextension`, enable the **ZeDs Godot Terminal** plugin, and open the **ZGT** bottom-panel tab. See [`CLAUDE.md`](CLAUDE.md) for architecture details.
+Then drop the `.so` into a project's `bin/` next to `zgt.gdextension`, enable the **ZeDs Godot Terminal** plugin, and open the **ZGT** bottom-panel tab. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it works inside.
 
 A test project lives in [`demo/`](demo/).
 
+## Scope
+
+Linux only, and that is not a temporary state — the native layer is built on
+`forkpty` and POSIX signals.
+
+Bug reports are welcome, especially anything that misrenders. Feature requests
+will likely sit: this is a tool I maintain because I use it every day, not a
+product with a roadmap. Patches are a faster path than issues.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
